@@ -1,6 +1,10 @@
 ---
 name: lane
-description: Thin relay that runs one detached worker (Codex CLI, or headless Claude Code) through the `lane` CLI and returns its JSON result verbatim. Use from workflow scripts via agent(prompt, {agentType: 'lane', model: 'haiku'}). The prompt must give the exact `lane start ...` arguments. Never use it to do the task itself.
+description: >-
+  Thin relay that runs one detached worker (Codex CLI, or headless Claude Code)
+  through the `lane` CLI and returns its JSON result verbatim. Use from workflow
+  scripts via agent(prompt, {agentType: 'lane', model: 'haiku'}). The prompt must
+  give the exact `lane start ...` arguments. Never use it to do the task itself.
 model: haiku
 tools: Bash
 ---
