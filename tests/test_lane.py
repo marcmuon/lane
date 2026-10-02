@@ -185,6 +185,9 @@ class LaneTest(unittest.TestCase):
         self.assertTrue(Path(r["worktree"]).is_dir())
         self.assertTrue(r["branch"].startswith("lane/"))
         self.assertEqual(Path(r["cwd"]).resolve(), Path(r["worktree"]).resolve())
+        brief = (Path(r["run_dir"]) / "brief.md").read_text()
+        self.assertIn(f"WORKING COPY: you are in {r['cwd']}", brief)   # not the Repo: path the brief names
+        self.assertLess(brief.index("WORKING COPY"), brief.index("OUTPUT CONTRACT"))
 
     def test_one_writer_per_checkout(self):
         repo = self.git_repo()
@@ -532,6 +535,176 @@ class LaneTest(unittest.TestCase):
                                                              "finished_at": time.time(), "quota_delta": 10}))
         with mock.patch.object(LANE_MODULE, "RUNS", runs):
             self.assertEqual(LANE_MODULE.lane_points_this_window(str(h2), time.time() + 86400), 10)
+
+    # --- user profiles and a local OpenAI-compatible server (spark provider) ---
+    def user_profiles(self, data):
+        (self.tmp / "state").mkdir(exist_ok=True)
+        (self.tmp / "state" / "profiles.json").write_text(json.dumps(data))
+
+    def test_user_profiles_sit_between_global_and_project(self):
+        impl = {"model": "user-model", "effort": "high", "sandbox": "workspace-write", "kind": "task", "max_time": "30m"}
+        self.user_profiles({"profiles": {"implement": impl, "mine": dict(impl, model="mine-model")}})
+        rc, r = self.route("Goal: x\n", "--profile", "mine")
+        self.assertEqual(r["model"], "mine-model")
+        self.assertTrue(r["routing"]["user_overrides"].endswith("profiles.json"))
+        self.assertEqual(self.route("Goal: x\n", "--profile", "implement")[1]["model"], "user-model")
+        repo = self.git_repo()
+        (repo / ".lane").mkdir()
+        (repo / ".lane" / "profiles.json").write_text(json.dumps({"profiles": {"implement": dict(impl, model="project-model")}}))
+        rc, r = self.lane("route", "--brief", str(self.brief), "--cwd", str(repo), "--profile", "implement")
+        self.assertEqual(r["model"], "project-model")
+
+    def spark_server(self, key, served=("served-model",), redirect_to=None, seen=None, payload=None, raw=None):
+        import http.server
+        import threading
+
+        class Models(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if seen is not None:
+                    seen.append(self.headers.get("Authorization"))
+                if redirect_to:
+                    self.send_response(302)
+                    self.send_header("Location", redirect_to + "/models")
+                    self.end_headers()
+                    return
+                if raw:
+                    self.wfile.write(raw(self.headers.get("Authorization", "")).encode())
+                    return
+                if self.headers.get("Authorization") != f"Bearer {key}":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                data = payload if payload is not None else {"data": [{"id": m, "max_model_len": 131072} for m in served]}
+                body = json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Models)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}/v1"
+
+    def test_spark_lane_finds_its_model_and_keeps_the_key_out_of_records(self):
+        key = "s3cret-test-key-123"
+        base = self.spark_server(key)
+        keyfile = self.tmp / "spark-key"
+        keyfile.write_text(key + "\n")
+        self.user_profiles({"providers": {"spark": {"base_url": base, "api_key_file": str(keyfile)}},
+                            "profiles": {"spark": {"provider": "spark", "model": "auto", "effort": "xhigh",
+                                                   "sandbox": "read-only", "kind": "task", "max_time": "10m"}}})
+        dump = self.tmp / "worker-env.json"
+        rc, r = self.run_lane("--profile", "spark", FAKE_CODEX_ENV_DUMP=dump)
+        self.assertEqual((rc, r["status"], r["provider"], r["model"]), (0, "ok", "spark", "served-model"))
+        self.assertEqual(json.loads(dump.read_text())["LANE_SPARK_KEY"], key)
+        run = Path(r["run_dir"])
+        argv = json.loads((run / "argv.json").read_text())["argv"]
+        self.assertIn(f"model_providers.spark.base_url={json.dumps(base)}", argv)
+        self.assertIn("model_context_window=131072", argv)
+        for f in run.iterdir():
+            self.assertNotIn(key, f.read_text(errors="replace"), f.name)
+        rc, r = self.run_lane("--profile", "spark", "--model", "other-model")
+        self.assertEqual((rc, r["status"], r["served"]), (2, "model_not_served", ["served-model"]))
+        keyfile.write_text("wrong-key")
+        rc, r = self.run_lane("--profile", "spark")
+        self.assertEqual((rc, r["status"]), (4, "provider_unavailable"))
+        self.assertNotIn("wrong-key", json.dumps(r))
+
+    SPARK = {"provider": "spark", "model": "auto", "effort": "xhigh", "sandbox": "read-only", "kind": "task", "max_time": "10m"}
+
+    def spark_setup(self, base, key):
+        keyfile = self.tmp / "spark-key"
+        keyfile.write_text(key + "\n")
+        self.user_profiles({"providers": {"spark": {"base_url": base, "api_key_file": str(keyfile)}},
+                            "profiles": {"spark": self.SPARK}})
+        return keyfile
+
+    def test_spark_key_never_goes_to_another_host(self):
+        key = "s3cret-test-key-456"
+        seen = []
+        elsewhere = self.spark_server(key, seen=seen)
+        self.spark_setup(self.spark_server(key, redirect_to=elsewhere), key)
+        rc, r = self.run_lane("--profile", "spark")
+        self.assertEqual((rc, r["status"]), (4, "provider_unavailable"))
+        self.assertEqual(seen, [])                       # the redirect was not followed
+        self.spark_setup(self.spark_server(key), key)
+        repo = self.git_repo()
+        (repo / ".lane").mkdir()
+        (repo / ".lane" / "profiles.json").write_text(json.dumps({"providers": {"spark": {"base_url": elsewhere}}}))
+        rc, r = self.lane("run", "--brief", str(self.brief), "--cwd", str(repo), "--profile", "spark")
+        self.assertEqual(r["status"], "error")
+        self.assertIn("providers", r["error"])
+        self.assertEqual(seen, [])                       # a repo can't point the key somewhere else
+
+    def test_spark_key_problems_are_refused_without_echoing_it(self):
+        key = "s3cret-test-key-789"
+        keyfile = self.spark_setup(self.spark_server(key), key)
+        keyfile.write_text(key + "\nsecond line\n")
+        rc, r = self.run_lane("--profile", "spark")
+        self.assertEqual((rc, r["status"]), (2, "usage_error"))
+        self.assertNotIn(key, json.dumps(r))
+        keyfile.write_text("\n")
+        rc, r = self.run_lane("--profile", "spark")
+        self.assertEqual((rc, r["status"]), (2, "usage_error"))
+        for payload in ([], {"data": None}, {"data": [{"id": 7}]}):
+            self.spark_setup(self.spark_server(key, payload=payload), key)
+            rc, r = self.run_lane("--profile", "spark")
+            self.assertEqual(r["status"], "provider_unavailable" if payload != {"data": [{"id": 7}]} else "usage_error", payload)
+
+    def test_spark_key_is_hidden_from_commands_and_scrubbed_from_records(self):
+        key = "s3cret-test-key-abc"
+        self.spark_setup(self.spark_server(key), key)
+        rc, r = self.run_lane("--profile", "spark", FAKE_CODEX_LEAK_ENV="LANE_SPARK_KEY")
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn(key, json.dumps(r))
+        run = Path(r["run_dir"])
+        for f in run.iterdir():
+            self.assertNotIn(key, f.read_text(errors="replace"), f.name)
+        self.assertIn("<redacted>", (run / "final.md").read_text())
+        argv = json.loads((run / "argv.json").read_text())["argv"]
+        self.assertTrue(any(a.startswith("shell_environment_policy.exclude=") and "LANE_SPARK_KEY" in a for a in argv))
+
+    def test_spark_key_stays_out_even_when_rotated_escaped_or_reflected(self):
+        key = 'q"uo\\te-secret-42'                      # a quote and a backslash: JSON escapes both
+        keyfile = self.spark_setup(self.spark_server(key), key)
+        rc, r = self.run_lane("--profile", "spark", FAKE_CODEX_LEAK_ENV="LANE_SPARK_KEY", FAKE_CODEX_CLOBBER=keyfile)
+        self.assertEqual(r["status"], "ok")
+        escaped = json.dumps(key)[1:-1]
+        for form in (key, escaped):
+            self.assertNotIn(form, json.dumps(r))
+            for f in Path(r["run_dir"]).iterdir():
+                self.assertNotIn(form, f.read_text(errors="replace"), f.name)
+        key = "s3cret-test-key-def"
+        self.spark_setup(self.spark_server(key, raw=lambda auth: f"HTTP/1.1 9x9 {auth}\r\n\r\n"), key)
+        rc, r = self.run_lane("--profile", "spark")
+        self.assertEqual(r["status"], "provider_unavailable")
+        self.assertNotIn(key, json.dumps(r))
+        self.spark_setup(self.spark_server(key, served=(f"model-{key}",)), key)
+        rc, r = self.run_lane("--profile", "spark", "--model", "pinned")
+        self.assertEqual(r["status"], "model_not_served")
+        self.assertNotIn(key, json.dumps(r))
+
+    def test_watch_redacts_a_running_spark_lane(self):
+        key = "s3cret-test-key-ghi"
+        self.spark_setup(self.spark_server(key), key)
+        _, s = self.lane("start", "--brief", str(self.brief), "--cwd", str(self.work), "--profile", "spark",
+                         FAKE_CODEX_MODE="slow", FAKE_CODEX_SLEEP=3, FAKE_CODEX_LEAK_ENV="LANE_SPARK_KEY")
+        time.sleep(1.5)
+        p = subprocess.run([sys.executable, str(LANE), "watch", s["lane_id"]], capture_output=True, text=True,
+                           env=self.env, timeout=30)
+        self.assertIn("thinking about", p.stdout)
+        self.assertNotIn(key, p.stdout)
+
+    def test_spark_provider_fields_must_be_strings(self):
+        for bad in (False, 0, [], {}):
+            self.user_profiles({"providers": {"spark": {"base_url": "http://127.0.0.1:9/v1", "api_key_keychain": bad}},
+                                "profiles": {"spark": self.SPARK}})
+            rc, r = self.run_lane("--profile", "spark")
+            self.assertEqual(r["status"], "error", bad)
+            self.assertIn("must be a string", r["error"])
 
     # --- argv hygiene ---
     def test_argv_pins_and_isolates(self):

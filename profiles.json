@@ -75,7 +75,7 @@
     },
     "draft-local": {
       "provider": "spark",
-      "model": "qwen3.8-flash-next",
+      "model": "auto",
       "effort": "high",
       "sandbox": "read-only",
       "kind": "task",

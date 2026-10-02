@@ -111,7 +111,8 @@ Common profiles are `investigate` for read-only exploration, `implement` for cod
 - [Profiles, routing rules, and retries](docs/reference.md#profiles)
 - [Quota checks and thresholds](docs/reference.md#quota-checks)
 - [Worker isolation](docs/reference.md#worker-isolation)
-- [Providers, including experimental options](docs/reference.md#providers)
+- [Your own profiles, kept out of the repo](docs/reference.md#your-own-profiles)
+- [Providers, including a self-hosted model server](docs/reference.md#providers)
 - [Configuration](docs/reference.md#configuration)
 - [Tests](docs/reference.md#tests)
 

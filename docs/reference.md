@@ -8,6 +8,7 @@
 - [Checkout locking](#checkout-locking)
 - [Worker isolation](#worker-isolation)
 - [Profiles](#profiles)
+- [Your own profiles](#your-own-profiles)
 - [Providers](#providers)
 - [Configuration](#configuration)
 - [Tests](#tests)
@@ -42,9 +43,9 @@ Other `start` flags: `--kind task|review`, `--sandbox read-only|workspace-write`
 | `timeout`, `cancelled` | Stopped by `--max-time` or `lane cancel`. |
 | `error` | Anything else. `summary` holds the worker's error or the tail of its stderr. |
 
-Refusals, before anything runs: `busy` (no free slot), `busy_worktree` (another write lane holds the path), `capped_preflight`, `budget_spent`, `usage_error`, `bad_profile`, `unknown_profile`, `profile_disabled`, `owned_paths_missing`, `explicit_profile_required`, `escalate_to_claude`.
+Refusals, before anything runs: `busy` (no free slot), `busy_worktree` (another write lane holds the path), `provider_unavailable` (a self-hosted server didn't answer), `capped_preflight`, `budget_spent`, `usage_error`, `bad_profile`, `unknown_profile`, `profile_disabled`, `model_not_served`, `owned_paths_missing`, `explicit_profile_required`, `escalate_to_claude`.
 
-Exit codes: 0 success (finished `ok`, `started`, `routed`, cancel requested), 1 finished not ok or error, 2 usage or routing refusal, 3 still running, 4 no slot or path held (`busy`, `busy_worktree`), 5 quota refusal.
+Exit codes: 0 success (finished `ok`, `started`, `routed`, cancel requested), 1 finished not ok or error, 2 usage or routing refusal, 3 still running, 4 no slot, path held or server down (`busy`, `busy_worktree`, `provider_unavailable`), 5 quota refusal.
 
 ## Result example
 
@@ -73,7 +74,7 @@ A write lane reserves its whole repository checkout (or its own worktree), plus 
 
 ## Worker isolation
 
-Codex workers run without your user config, hooks, MCP servers or nested agents; Claude workers get the repo's project settings and no MCP servers. Every lane runs with an explicit model and effort, and the result also records the model the worker reported (and, for Codex, the effort). Secret-looking environment variables are stripped. A wall-clock limit kills the worker's whole process group, and if any of it survives, the lane ends in `error` and keeps its paths reserved. The report must open with `STATUS: DONE|BLOCKED` or `VERDICT: LGTM|REVISE`. Lane checks this report format; the caller still needs to assess the result.
+Codex workers run without your user config, hooks, MCP servers or nested agents; Claude workers get the repo's project settings and no MCP servers. Every lane runs with an explicit model and effort, and the result also records the model the worker reported (and, for Codex, the effort). Secret-looking environment variables are stripped. A wall-clock limit kills the worker's whole process group, and if any of it survives, the lane ends in `error` and keeps its paths reserved. A worktree lane's brief also names its working copy, so a model that follows the brief's `Repo:` path doesn't edit the original checkout. The report must open with `STATUS: DONE|BLOCKED` or `VERDICT: LGTM|REVISE`. Lane checks this report format; the caller still needs to assess the result.
 
 ## Profiles
 
@@ -90,7 +91,7 @@ Codex workers run without your user config, hooks, MCP servers or nested agents;
 | `review`, `review-deep` | gpt-6-astra high, xhigh | read-only, 30m and 45m |
 | `opus`, `opus-review` | Claude Opus xhigh, high | headless `claude -p`; `opus` gets its own worktree |
 | `luna-trial` | gpt-6-luna max | own worktree, 45m |
-| `draft-local` | a local model | disabled until you set it up |
+| `draft-local` | whatever your self-hosted server serves | disabled until you set it up (see [Providers](#providers)) |
 
 Ladders for `--retry-of`: implement-light → implement → implement-hard → opus → escalate_to_claude, and review → review-deep → escalate_to_claude.
 
@@ -104,20 +105,45 @@ Keywords count only in the `Goal:` and `Do:` sections.
 
 The keyword lists live in `profiles.json`.
 
-To change profiles for one repo, put a `.lane/profiles.json` in it. Its `profiles`, `ladder` and `keywords` entries replace the global ones with the same name, and `lane route` shows `routing.project_overrides` when that happened.
+## Your own profiles
+
+Profiles load in three layers: the shipped `profiles.json`, then your own `~/.lane/profiles.json` (`$LANE_STATE/profiles.json`), then `<repo>/.lane/profiles.json` for lanes started in that repo. Each layer replaces whole entries by name in its `profiles`, `ladder`, `keywords` and `providers` sections, and `lane route` shows `routing.user_overrides` and `routing.project_overrides` when a layer applied.
+
+Keep machine-specific settings, like a server address, in your own file rather than in a repository. Only your own file can set `providers`; a repo's `.lane/profiles.json` that tries is an error, so a checkout can't send your API key to a server of its choosing.
 
 ## Providers
 
 - `openai` (default): `codex exec` with `CODEX_HOME` set to the lane home.
 - `claude`: headless `claude -p` with project settings only, no MCP servers and no slash commands. Its `git push`, `gh`, web fetch and web search tools are denied; these are tool rules, not a sandbox (see [known limits](../README.md#known-limits)). The repo's `CLAUDE.md` and `AGENTS.md` are passed in as rules. New Claude lanes are refused once the last 7-day reading Claude Code reported reaches 80%.
-- `deepseek`, `spark`: experimental and untested. They point Codex at DeepSeek's API or at a local vLLM server. Keys come from the environment or the macOS Keychain.
+- `spark`: Codex against a self-hosted, OpenAI-compatible server that speaks the Responses API, such as vLLM on a DGX Spark. See [Self-hosted server](#self-hosted-server).
+- `deepseek`: experimental and untested. Points Codex at DeepSeek's API; the key comes from `DEEPSEEK_API_KEY` or the macOS Keychain.
+
+### Self-hosted server
+
+Describe the server in your own `~/.lane/profiles.json`:
+
+```json
+{
+  "providers": {"spark": {"base_url": "http://my-server:8000/v1", "api_key_file": "~/.config/my-server/api-key"}},
+  "profiles": {"spark": {"provider": "spark", "model": "auto", "effort": "medium", "sandbox": "read-only",
+                         "kind": "task", "max_time": "30m"}},
+  "ladder": {"spark": "investigate"}
+}
+```
+
+Then run `lane run --brief ... --cwd ... --profile spark`. `auto` routing never picks a self-hosted profile; name it.
+
+- **Model.** `"model": "auto"` asks the server's `/models` at each start and uses the one model it serves, so switching models on the server needs no profile change. It refuses if the server lists none or several. A pinned model that isn't being served is refused with `model_not_served`. lane also passes the served context length to Codex.
+- **Availability.** A start is refused with `provider_unavailable` (exit 4) if the server doesn't answer `/models`, so no worker runs against a server that is down.
+- **Key.** Use `api_key_file`, or `api_key_keychain` (a Keychain service name). With neither, lane uses the Keychain service in `LANE_SPARK_KEYCHAIN_SERVICE` if set, and otherwise sends no key. A configured key source that is empty, unreadable or more than one line is refused, not skipped. lane sends the key only to `base_url`, without following redirects or using a proxy. It reaches Codex in an environment variable that commands the model runs can't see. If the worker prints it anyway, `lane watch` shows `<redacted>` in its place, and lane replaces it in the run's records when the run ends. Until then, or if the supervisor dies mid-run, the raw files in the run directory can still hold it.
+- **Effort.** Some models accept only certain reasoning efforts. If the server rejects one with HTTP 400, change the profile's `effort`.
 
 ## Configuration
 
 | Variable | Default | |
 |---|---|---|
 | `LANE_CODEX_HOME` | `~/.codex-lane` | Codex home for lanes without `--codex-home` |
-| `LANE_STATE` | `~/.lane` | run directories, lock, Claude quota cache |
+| `LANE_STATE` | `~/.lane` | run directories, your own `profiles.json`, lock, Claude quota cache |
 | `LANE_WORKTREE_ROOT` | `~/Projects/worktrees` | where `--worktree` lanes get their checkout |
 | `LANE_MAX_CONCURRENT` | 4 | lanes running at once, across all callers |
 | `LANE_QUOTA_STOP`, `LANE_QUOTA_STOP_REVIEW`, `LANE_QUOTA_STOP_SHORT` | 90, 95, 98 | refusal thresholds in percent |
@@ -126,7 +152,8 @@ To change profiles for one repo, put a `.lane/profiles.json` in it. Its `profile
 | `LANE_CLAUDE_MAX_TURNS` | 250 | |
 | `LANE_PROFILES` | `profiles.json` next to `lane` | |
 | `LANE_CODEX_BIN`, `LANE_CLAUDE_BIN` | `codex`, `claude` | |
-| `LANE_DEEPSEEK_CATALOG`, `LANE_SPARK_BASE_URL`, `LANE_SPARK_KEYCHAIN_SERVICE` | | experimental providers |
+| `LANE_SPARK_BASE_URL`, `LANE_SPARK_KEYCHAIN_SERVICE` | | self-hosted server, if not set in your profiles file |
+| `LANE_DEEPSEEK_CATALOG` | | experimental DeepSeek provider |
 
 Each run lives in `$LANE_STATE/runs/<lane_id>/`, which can hold `brief.md` (with the output contract appended), `params.json`, `argv.json`, `events.jsonl`, `stderr.log`, `final.md` and `result.json`.
 

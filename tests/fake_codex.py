@@ -36,8 +36,15 @@ def rollout(used_after):
             "plan_type": "pro"}}}) + "\n")
 
 
+if os.environ.get("FAKE_CODEX_ENV_DUMP"):
+    Path(os.environ["FAKE_CODEX_ENV_DUMP"]).write_text(json.dumps({"LANE_SPARK_KEY": os.environ.get("LANE_SPARK_KEY")}))
 ev({"type": "thread.started", "thread_id": thread})
 ev({"type": "turn.started"})
+_leak = os.environ.get(os.environ.get("FAKE_CODEX_LEAK_ENV", ""), "")
+if _leak:
+    ev({"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": f"thinking about {_leak}"}})
+if os.environ.get("FAKE_CODEX_CLOBBER"):
+    Path(os.environ["FAKE_CODEX_CLOBBER"]).write_text("rotated-key\n")
 if mode == "slow_child":
     # a descendant that ignores SIGTERM, so only a whole-group KILL stops it
     import subprocess
@@ -59,7 +66,10 @@ if mode == "auth":
 if mode == "reconnect_then_ok":
     ev({"type": "error", "message": "Reconnecting... 2/2 (stream disconnected before completion)"})
     mode = "ok_task"
-texts = {"ok_task": "STATUS: DONE\nChanged a.py; ran pytest -q: 3 passed.",
+leak = os.environ.get(os.environ.get("FAKE_CODEX_LEAK_ENV", ""), "")
+if leak:
+    print(f"worker saw {leak}", file=sys.stderr)
+texts = {"ok_task": "STATUS: DONE\nChanged a.py; ran pytest -q: 3 passed." + (f" key={leak}" if leak else ""),
          "ok_review": "VERDICT: REVISE\n1. lane:10 off-by-one. Fix: use <=.",
          "nomarker": "I did the thing.", "late_marker": "Here is my report.\nSTATUS: DONE", "noreport": "", "o_missing": "STATUS: DONE\nfrom the event stream"}
 text = texts[mode]

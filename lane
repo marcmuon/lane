@@ -14,8 +14,9 @@ Commands:
   lane wait   ID [--max SECONDS]         block until the lane finishes (or --max elapses: status=running, exit 3)
   lane run    (same flags as start)      start + wait until finished
   lane route  (same flags as start)      print the routing decision; launches nothing
-  Profiles: --profile NAME|auto picks model/effort/sandbox/time from profiles.json (auto = deterministic rules
-  over the brief); --retry-of ID escalates one step on the ladder. Explicit --model/--effort override one field.
+  Profiles: --profile NAME|auto picks model/effort/sandbox/time from profiles.json, then $LANE_STATE/profiles.json,
+  then <repo>/.lane/profiles.json (auto = deterministic rules over the brief); --retry-of ID escalates one step on
+  the ladder. Explicit --model/--effort override one field. Model "auto" (spark provider) asks the server.
   lane result ID | lane status [--all] | lane quota [--codex-home DIR] | lane cancel ID
   lane watch [ID]                        live, readable view of one lane (or every running lane)
 
@@ -28,6 +29,7 @@ import argparse
 import fcntl
 import glob
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -37,6 +39,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 CONFIG_ERRORS: list[str] = []
@@ -99,6 +103,7 @@ PROVIDERS = ("openai", "deepseek", "spark", "claude")
 SANDBOXES = ("read-only", "workspace-write")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 PROFILE_FIELDS = ("model", "effort", "kind", "sandbox", "max_time")
+PROFILE_SECTIONS = ("profiles", "ladder", "keywords", "providers")
 
 
 class UsageError(Exception):
@@ -344,23 +349,31 @@ def running_lanes() -> list[dict]:
 
 def checked_profile_file(path: Path, data) -> dict:
     """A profiles file's top level must be objects all the way down to the profile entries."""
-    if not isinstance(data, dict) or any(not isinstance(data.get(k, {}), dict) for k in ("profiles", "ladder", "keywords")):
-        raise ValueError(f"{path}: expected an object with profiles, ladder and keywords objects")
+    if not isinstance(data, dict) or any(not isinstance(data.get(k, {}), dict) for k in PROFILE_SECTIONS):
+        raise ValueError(f"{path}: expected an object whose {', '.join(PROFILE_SECTIONS)} entries are objects")
+    if any(not isinstance(v, dict) for v in data.get("providers", {}).values()):
+        raise ValueError(f"{path}: each providers entry must be an object")
     return data
 
 
 def load_profiles(cwd: str | Path | None = None) -> dict:
-    """Global profiles.json, then <repo>/.lane/profiles.json on top (per-project overrides of whole profiles)."""
+    """The shipped profiles.json, then your own $LANE_STATE/profiles.json, then <repo>/.lane/profiles.json.
+    Each later file replaces whole entries (a profile, a ladder step, a keyword list, a provider) by name."""
     raw = PROFILES_PATH.read_bytes()
     data = checked_profile_file(PROFILES_PATH, json.loads(raw))
     repo = git(cwd, "rev-parse", "--show-toplevel") if cwd else None
-    local = Path(repo) / ".lane" / "profiles.json" if repo else None
-    if local and local.is_file():
-        over = checked_profile_file(local, json.loads(local.read_text()))
-        for section in ("profiles", "ladder", "keywords"):
-            data.setdefault(section, {}).update(over.get(section, {}))
-        data["project_overrides"] = str(local)
-        raw += local.read_bytes()
+    for key, path in (("user_overrides", STATE / "profiles.json"),
+                      ("project_overrides", Path(repo) / ".lane" / "profiles.json" if repo else None)):
+        if path and path.is_file():
+            text = path.read_bytes()
+            over = checked_profile_file(path, json.loads(text))
+            if key == "project_overrides" and over.get("providers"):
+                # a checkout must not be able to send your API key to a server of its choosing
+                raise ValueError(f"{path}: providers can only be set in {STATE / 'profiles.json'}")
+            for section in PROFILE_SECTIONS:
+                data.setdefault(section, {}).update(over.get(section, {}))
+            data[key] = str(path)
+            raw += text
     data["hash"] = "sha256:" + hashlib.sha256(raw).hexdigest()[:16]
     return data
 
@@ -459,7 +472,7 @@ def resolve_route(a: argparse.Namespace, brief_text: str) -> tuple[dict | None, 
         return routing, None
     data = load_profiles(a.cwd)
     routing.update(mode="auto" if name == "auto" else "named", profile_set_hash=data["hash"],
-                   project_overrides=data.get("project_overrides"))
+                   user_overrides=data.get("user_overrides"), project_overrides=data.get("project_overrides"))
     if name == "auto":
         a.kind = a.kind or "task"
         a.sandbox = a.sandbox or "read-only"
@@ -493,6 +506,147 @@ def resolve_route(a: argparse.Namespace, brief_text: str) -> tuple[dict | None, 
         a.worktree = True
     routing["profile"] = name
     return routing, None
+
+
+# ---------- self-hosted servers (spark provider) ----------
+
+def provider_endpoint(provider: str, cwd: str | None) -> dict | None:
+    """Where a self-hosted provider lives: the "providers" section of your profiles file, else LANE_SPARK_* env.
+    Holds the URL and where the key is kept, never the key itself."""
+    if provider != "spark":
+        return None
+    ep = dict(load_profiles(cwd).get("providers", {}).get("spark") or {})
+    for field in ("base_url", "api_key_file", "api_key_keychain"):
+        if field in ep and not isinstance(ep[field], str):
+            raise ValueError(f"providers.{provider}.{field} must be a string")
+    ep.setdefault("base_url", os.environ.get("LANE_SPARK_BASE_URL", ""))
+    if not ep.get("api_key_file") and not ep.get("api_key_keychain"):
+        ep["api_key_keychain"] = os.environ.get("LANE_SPARK_KEYCHAIN_SERVICE", "")
+    if ep.get("base_url") and not re.match(r"https?://", ep["base_url"]):
+        raise ValueError(f"providers.{provider}.base_url must start with http:// or https://")
+    return {k: ep[k] for k in ("base_url", "api_key_file", "api_key_keychain") if ep.get(k)}
+
+
+class KeySourceError(ValueError):
+    """A configured key source that failed. Its message never contains the key."""
+
+
+def endpoint_key(ep: dict) -> str:
+    """The server's API key, read when needed and handed only to the worker's environment. "" when no key source
+    is configured; KeySourceError when one is configured but empty, unreadable or malformed."""
+    if ep.get("api_key_file"):
+        where = f"api_key_file {ep['api_key_file']}"
+        try:
+            key = Path(ep["api_key_file"]).expanduser().read_text().strip()
+        except OSError as exc:
+            raise KeySourceError(f"can't read {where} ({type(exc).__name__})") from None
+    elif ep.get("api_key_keychain"):
+        where = f"Keychain item {ep['api_key_keychain']}"
+        key = keychain(ep["api_key_keychain"])
+    else:
+        return ""
+    if not key:
+        raise KeySourceError(f"{where} is empty or missing")
+    if any(c.isspace() or not c.isprintable() for c in key):
+        raise KeySourceError(f"{where} must hold just the key, on one line")
+    return key
+
+
+def redact(text: str, secret: str) -> str:
+    """Replace the secret, and its JSON-escaped form, with <redacted>."""
+    if not (secret and text):
+        return text
+    for form in {secret, json.dumps(secret)[1:-1]}:
+        text = text.replace(form, "<redacted>")
+    return text
+
+
+def redact_obj(obj: dict, secret: str) -> dict:
+    return json.loads(redact(json.dumps(obj), secret)) if secret else obj
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None                    # never carry the Authorization header to another location
+
+
+def served_models(ep: dict, key: str) -> list[dict]:
+    """GET <base_url>/models, without proxies or redirects. Raises OSError or ValueError if the server can't be used."""
+    req = urllib.request.Request(ep["base_url"].rstrip("/") + "/models")
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+    with opener.open(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+    models = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(models, list) or not all(isinstance(m, dict) for m in models):
+        raise ValueError("unexpected /models response")
+    return models
+
+
+def resolve_served_model(a: argparse.Namespace, ep: dict) -> dict | None:
+    """Check the server answers, and turn model "auto" into the model it serves. Returns a refusal, or None."""
+    if not ep.get("base_url"):
+        return {"status": "usage_error",
+                "error": f"{a.provider} provider needs providers.{a.provider}.base_url in {STATE / 'profiles.json'}"}
+    try:
+        key = endpoint_key(ep)
+    except KeySourceError as exc:
+        return {"status": "usage_error", "error": str(exc)}
+    refusal = discover(a, ep, key)
+    return redact_obj(refusal, key) if refusal else None
+
+
+def discover(a: argparse.Namespace, ep: dict, key: str) -> dict | None:
+    try:
+        served = served_models(ep, key)
+    except urllib.error.HTTPError as exc:
+        why = f"HTTP {exc.code}" + (" (redirects are not followed)" if 300 <= exc.code < 400 else "")
+    except urllib.error.URLError as exc:
+        why = f"can't connect: {exc.reason}"
+    except (http.client.HTTPException, OSError, ValueError) as exc:
+        why = f"bad reply ({type(exc).__name__})"     # never the exception text: it can quote the request
+    else:
+        why = None
+    if why:
+        return {"status": "provider_unavailable", "provider": a.provider, "base_url": ep["base_url"], "error": why[:300]}
+    ids = [m.get("id") for m in served]
+    if not all(isinstance(i, str) and i.strip() for i in ids):
+        return {"status": "usage_error", "error": "the server's /models list has an entry without a string id"}
+    if a.model == "auto":
+        if len(ids) != 1:
+            return {"status": "usage_error", "error": "model auto needs exactly one served model", "served": ids}
+        a.model = ids[0]
+    elif a.model not in ids:
+        return {"status": "model_not_served", "model": a.model, "served": ids}
+    window = next((m.get("max_model_len") for m in served if m["id"] == a.model), None)
+    if isinstance(window, int) and window > 0:
+        ep["context_window"] = window
+    return None
+
+
+def worker_secret(p: dict) -> str:
+    """The API key a run's worker was given, so it can be scrubbed from the run's records ("" if none)."""
+    try:
+        if p.get("provider") == "spark":
+            return endpoint_key(p.get("endpoint") or {})
+        if p.get("provider") == "deepseek":
+            return os.environ.get("DEEPSEEK_API_KEY") or keychain("deepseek-api-key")
+    except (KeySourceError, OSError):
+        pass
+    return ""
+
+
+def scrub_run(run: Path, secret: str) -> None:
+    """Replace the key anywhere the worker may have echoed it: report, event stream, logs."""
+    if not secret:
+        return
+    for f in run.iterdir():
+        if f.is_file():
+            text = f.read_text(errors="replace")
+            clean = redact(text, secret)
+            if clean != text:
+                f.write_text(clean)
 
 
 # ---------- codex argv ----------
@@ -613,6 +767,7 @@ def build_argv(p: dict, final_path: Path) -> tuple[list[str], dict]:
             "-c", f"developer_instructions={json.dumps(DEV_INSTRUCTIONS)}",
             "-c", "shell_environment_policy.experimental_use_profile=false",
             "-c", 'shell_environment_policy.inherit="all"',
+            "-c", 'shell_environment_policy.exclude=["LANE_SPARK_KEY", "DEEPSEEK_API_KEY"]',   # model-run commands
             "-c", f"shell_environment_policy.set.PATH={json.dumps(os.environ.get('PATH', ''))}",
             "-s", p["sandbox"], "-C", p["cwd"]]
     env = worker_env()
@@ -638,21 +793,26 @@ def build_argv(p: dict, final_path: Path) -> tuple[list[str], dict]:
         if catalog and Path(catalog).expanduser().exists():
             argv += ["-c", f"model_catalog_json={json.dumps(str(Path(catalog).expanduser()))}"]
     if p["provider"] == "spark":
-        # EXPERIMENTAL, never exercised: vLLM on the DGX Spark via the Responses API.
-        base = os.environ.get("LANE_SPARK_BASE_URL", "")
-        service = os.environ.get("LANE_SPARK_KEYCHAIN_SERVICE", "")
-        key = keychain(service) if service else ""
-        if not base or not key:
-            raise UsageError("spark provider needs LANE_SPARK_BASE_URL and LANE_SPARK_KEYCHAIN_SERVICE (Keychain)")
-        env["LANE_SPARK_KEY"] = key
-        argv += ["-c", 'model_provider="spark"', "-c", 'model_providers.spark.name="DGX Spark vLLM"',
-                 "-c", f"model_providers.spark.base_url={json.dumps(base)}",
-                 "-c", 'model_providers.spark.env_key="LANE_SPARK_KEY"',
+        # Any OpenAI-compatible server that speaks the Responses API, such as vLLM on a DGX Spark.
+        ep = p.get("endpoint") or {}
+        if not ep.get("base_url"):
+            raise UsageError("spark provider needs a base_url")
+        try:
+            key = endpoint_key(ep)
+        except KeySourceError as exc:
+            raise UsageError(str(exc)) from None
+        argv += ["-c", 'model_provider="spark"', "-c", 'model_providers.spark.name="spark"',
+                 "-c", f"model_providers.spark.base_url={json.dumps(ep['base_url'])}",
                  "-c", "model_providers.spark.requires_openai_auth=false",
                  "-c", 'model_providers.spark.wire_api="responses"',
                  "-c", "model_providers.spark.supports_websockets=false",
                  "-c", "model_providers.spark.request_max_retries=0",
                  "-c", "model_providers.spark.stream_max_retries=0"]
+        if key:
+            env["LANE_SPARK_KEY"] = key
+            argv += ["-c", 'model_providers.spark.env_key="LANE_SPARK_KEY"']
+        if ep.get("context_window"):
+            argv += ["-c", f"model_context_window={ep['context_window']}"]
     if p["network"]:
         argv += ["-c", "sandbox_workspace_write.network_access=true"]
     for d in p["add_dir"] + ([p["git_dir"]] if p.get("git_dir") else []):
@@ -777,6 +937,7 @@ def supervise(lane_id: str) -> int:
         argv, env = build_claude_argv(p, run) if p["provider"] == "claude" else build_argv(p, final_path)
     except UsageError as exc:
         return finish(run, p, status, rc=None, timed_out=False, cancelled=False, started=started, setup_error=str(exc))
+    secret = env.get("LANE_SPARK_KEY") or (env.get("DEEPSEEK_API_KEY") if p["provider"] == "deepseek" else "") or ""
     write_json(run / "argv.json", {"argv": argv})
     if (run / "cancel").exists():      # a cancel may land while build_argv waits on Keychain
         return finish(run, p, status, rc=None, timed_out=False, cancelled=True, started=started)
@@ -813,15 +974,16 @@ def supervise(lane_id: str) -> int:
         except subprocess.TimeoutExpired:
             pass
     return finish(run, p, status, rc=proc.returncode, timed_out=timed_out, cancelled=cancelled, started=started,
-                  setup_error="" if stopped else STUCK_GROUP, stuck=not stopped)
+                  setup_error="" if stopped else STUCK_GROUP, stuck=not stopped, secret=secret)
 
 
 STUCK_GROUP = "worker process group survived SIGKILL; its write roots stay reserved until it exits"
 
 
 def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: bool, started: float,
-           setup_error: str = "", stuck: bool = False) -> int:
+           setup_error: str = "", stuck: bool = False, secret: str | None = None) -> int:
     is_claude = p["provider"] == "claude"
+    scrub_run(run, secret if secret is not None else worker_secret(p))
     ev = parse_claude_events(run / "events.jsonl") if is_claude else parse_events(run / "events.jsonl")
     if is_claude:
         record_claude_rate(ev.get("rate"))
@@ -904,6 +1066,13 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
     codex_home = str(Path(a.codex_home or DEFAULT_HOME).expanduser().absolute())
     if a.provider == "openai" and not (Path(codex_home) / "auth.json").exists():
         return emit({"status": "usage_error", "error": f"no auth.json in {codex_home}"}, 2)
+    endpoint = provider_endpoint(a.provider, a.cwd)
+    if endpoint is not None:
+        refusal = resolve_served_model(a, endpoint)
+        if refusal:
+            return emit(refusal, 4 if refusal["status"] == "provider_unavailable" else 2)
+    elif a.model == "auto":
+        return emit({"status": "usage_error", "error": f"model auto only works with a self-hosted provider, not {a.provider}"}, 2)
     repo = git(cwd, "rev-parse", "--show-toplevel")
     if a.worktree and not repo:
         return emit({"status": "usage_error", "error": "--worktree needs cwd inside a git repo"}, 2)
@@ -955,13 +1124,19 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
                     git_dir = common            # lets a worktree lane commit; not a reserved write root
             run.mkdir(parents=True)
             made_run = True
-            (run / "brief.md").write_text(brief_text.rstrip() + CONTRACTS[a.kind] + "\n")
+            where = ""
+            if worktree:   # briefs name the original checkout; some models go and work there
+                where = (f"\n\n---\nWORKING COPY: you are in {work_cwd}, a git worktree of {repo} on branch {branch}. "
+                         f"Read, edit, test and commit only there. Paths under {repo} in this brief mean the same "
+                         f"files in your working copy. Never change {repo} itself.")
+            (run / "brief.md").write_text(brief_text.rstrip() + where + CONTRACTS[a.kind] + "\n")
             params = {"kind": a.kind, "label": a.label or brief.stem, "provider": a.provider, "model": a.model,
                       "effort": a.effort, "sandbox": a.sandbox, "cwd": str(work_cwd), "codex_home": codex_home,
                       "tier": a.tier, "network": a.network, "add_dir": add_dirs, "git_dir": git_dir,
                       "max_time_s": a.max_time, "worktree": str(worktree) if worktree else None, "branch": branch,
                       "brief_source": str(brief), "quota_before": quota,
-                      "profile": routing.get("profile"), "routing": routing, "rules_cwd": str(cwd)}
+                      "profile": routing.get("profile"), "routing": routing, "rules_cwd": str(cwd),
+                      "endpoint": endpoint}
             write_json(run / "params.json", params)
             # reservation is published before the supervisor exists; from here on the supervisor owns status.json
             write_json(run / "status.json", {"lane_id": lane_id, "state": "starting", "write_roots": write_roots,
@@ -1104,6 +1279,7 @@ def describe_event(line: str, root: str = "") -> str | None:
 def cmd_watch(a: argparse.Namespace) -> int:
     """Follow one lane (or every live lane) as readable lines until it finishes. Ctrl-C to stop."""
     offsets: dict[str, int] = {}
+    secrets: dict[str, str] = {}
     one = a.lane_id
     if one and not (RUNS / one).is_dir():
         print(f"unknown lane {one}")
@@ -1118,6 +1294,8 @@ def cmd_watch(a: argparse.Namespace) -> int:
                 run = RUNS / lid
                 p = read_json(run / "params.json") or {}
                 root = p.get("cwd") or ""
+                if lid not in secrets:
+                    secrets[lid] = worker_secret(p)
                 ev_path = run / "events.jsonl"
                 if lid not in offsets:
                     offsets[lid] = 0
@@ -1129,7 +1307,7 @@ def cmd_watch(a: argparse.Namespace) -> int:
                             if not line.endswith("\n"):
                                 break
                             offsets[lid] += len(line.encode())
-                            d = describe_event(line, root)
+                            d = redact(describe_event(line, root) or "", secrets[lid])
                             if d:
                                 print(("[" + (p.get("label") or lid)[:18] + "] " if not one else "") + d, flush=True)
                 res = read_json(run / "result.json")
