@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "quick-investigate": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "effort": "low",
+      "sandbox": "read-only",
+      "kind": "task",
+      "worktree": false,
+      "max_time": "15m"
+    },
+    "investigate": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "effort": "high",
+      "sandbox": "read-only",
+      "kind": "task",
+      "worktree": false,
+      "max_time": "30m"
+    },
+    "draft": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "effort": "low",
+      "sandbox": "read-only",
+      "kind": "task",
+      "worktree": false,
+      "max_time": "30m"
+    },
+    "implement-light": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "effort": "medium",
+      "sandbox": "workspace-write",
+      "kind": "task",
+      "worktree": true,
+      "max_time": "45m"
+    },
+    "implement": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "effort": "high",
+      "sandbox": "workspace-write",
+      "kind": "task",
+      "worktree": true,
+      "max_time": "60m"
+    },
+    "implement-hard": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "effort": "xhigh",
+      "sandbox": "workspace-write",
+      "kind": "task",
+      "worktree": true,
+      "max_time": "90m"
+    },
+    "review": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "effort": "high",
+      "sandbox": "read-only",
+      "kind": "review",
+      "worktree": false,
+      "max_time": "30m"
+    },
+    "review-deep": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "effort": "xhigh",
+      "sandbox": "read-only",
+      "kind": "review",
+      "worktree": false,
+      "max_time": "45m"
+    },
+    "draft-local": {
+      "provider": "spark",
+      "model": "qwen3.8-flash-next",
+      "effort": "high",
+      "sandbox": "read-only",
+      "kind": "task",
+      "worktree": false,
+      "max_time": "30m",
+      "enabled": false
+    },
+    "luna-trial": {
+      "provider": "openai",
+      "model": "gpt-6-luna",
+      "effort": "max",
+      "sandbox": "workspace-write",
+      "kind": "task",
+      "worktree": true,
+      "max_time": "45m"
+    },
+    "opus": {
+      "provider": "claude",
+      "model": "opus",
+      "effort": "xhigh",
+      "sandbox": "workspace-write",
+      "kind": "task",
+      "worktree": true,
+      "max_time": "120m"
+    },
+    "opus-review": {
+      "provider": "claude",
+      "model": "opus",
+      "effort": "high",
+      "sandbox": "read-only",
+      "kind": "review",
+      "worktree": false,
+      "max_time": "45m"
+    }
+  },
+  "ladder": {
+    "quick-investigate": "investigate",
+    "investigate": "claude_agent",
+    "draft": "claude_agent",
+    "implement": "implement-hard",
+    "implement-hard": "opus",
+    "review": "review-deep",
+    "review-deep": "claude_agent",
+    "draft-local": "draft",
+    "implement-light": "implement",
+    "opus": "claude_agent",
+    "luna-trial": "implement",
+    "opus-review": "claude_agent"
+  },
+  "keywords": {
+    "hard": [
+      "design",
+      "architect",
+      "interface",
+      "migration",
+      "migrate",
+      "schema",
+      "concurrency",
+      "race",
+      "lock",
+      "invariant",
+      "security",
+      "auth",
+      "sandbox",
+      "crypto",
+      "evaluator",
+      "statistic",
+      "calibration",
+      "idempotency",
+      "reconcile",
+      "rollback",
+      "refactor"
+    ],
+    "simple": [
+      "find",
+      "list",
+      "locate",
+      "grep",
+      "rename",
+      "typo",
+      "format",
+      "lint",
+      "bump",
+      "docstring",
+      "count"
+    ],
+    "draft": [
+      "draft",
+      "write up",
+      "digest",
+      "summarize",
+      "summary",
+      "pr body",
+      "changelog"
+    ],
+    "risk": [
+      "broker",
+      "order",
+      "trading",
+      "payment",
+      "credential",
+      "keychain",
+      "api key",
+      "secret",
+      "token",
+      "sizing",
+      "kelly",
+      "halt",
+      "flatten"
+    ]
+  }
+}

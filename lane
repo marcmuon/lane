@@ -1,0 +1,1254 @@
+#!/usr/bin/env python3
+"""lane: run one bounded coding-agent worker (Codex CLI or headless Claude Code) detached, and report a compact
+JSON result.
+
+Harness-agnostic on purpose: Claude workflow agents, an Opus session, or a Codex orchestrator can all call it.
+
+Commands print exactly one JSON line on stdout. In a terminal, status and result print readable text instead
+(LANE_JSON=1 keeps JSON); watch always prints text.
+
+Commands:
+  lane start  --brief FILE --cwd DIR [--model M] [--effort E] [--kind task|review] [--sandbox read-only|workspace-write]
+              [--worktree] [--label L] [--max-time 60m] [--provider openai|claude|deepseek|spark] [--tier default|fast|flex]
+              [--network] [--add-dir DIR]... [--codex-home DIR] [--wait-slot SECONDS] [--force]
+  lane wait   ID [--max SECONDS]         block until the lane finishes (or --max elapses: status=running, exit 3)
+  lane run    (same flags as start)      start + wait until finished
+  lane route  (same flags as start)      print the routing decision; launches nothing
+  Profiles: --profile NAME|auto picks model/effort/sandbox/time from profiles.json (auto = deterministic rules
+  over the brief); --retry-of ID escalates one step on the ladder. Explicit --model/--effort override one field.
+  lane result ID | lane status [--all] | lane quota [--codex-home DIR] | lane cancel ID
+  lane watch [ID]                        live, readable view of one lane (or every running lane)
+
+Exit codes: 0 finished ok | 1 finished not ok / error | 2 usage | 3 still running | 4 no slot | 5 quota refused
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import glob
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONFIG_ERRORS: list[str] = []
+
+
+def env_number(name: str, default, cast=float, low=None, high=None):
+    """A numeric setting from the environment. A bad value is reported by main() as one JSON line."""
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return cast(default)
+    try:
+        value = cast(raw)
+    except ValueError:
+        value = None
+    if value is None or not math.isfinite(value) or (low is not None and value < low) or \
+            (high is not None and value > high):
+        want = f"a number from {low} to {high}" if high is not None else f"a number of at least {low}"
+        CONFIG_ERRORS.append(f"{name} must be {want}, not {raw!r}")
+        return cast(default)
+    return value
+
+
+HOME = Path(os.path.expanduser("~"))
+STATE = Path(os.environ.get("LANE_STATE", HOME / ".lane"))
+RUNS = STATE / "runs"
+CODEX_BIN = os.environ.get("LANE_CODEX_BIN", "codex")
+CLAUDE_BIN = os.environ.get("LANE_CLAUDE_BIN", "claude")
+CLAUDE_MAX_TURNS = env_number("LANE_CLAUDE_MAX_TURNS", 250, int, low=1)
+CLAUDE_WEEKLY_STOP = env_number("LANE_CLAUDE_WEEKLY_STOP", 0.80, low=0, high=1)  # 7-day utilization at which Opus lanes stop
+CLAUDE_QUOTA_FILE = STATE / "claude-quota.json"
+DEFAULT_HOME = os.environ.get("LANE_CODEX_HOME", str(HOME / ".codex-lane"))
+WORKTREE_ROOT = Path(os.environ.get("LANE_WORKTREE_ROOT", HOME / "Projects" / "worktrees")).expanduser().resolve()
+MAX_CONCURRENT = env_number("LANE_MAX_CONCURRENT", 4, int, low=1)
+QUOTA_STOP_TASK = env_number("LANE_QUOTA_STOP", 90, low=0, high=100)                      # task lanes stop at this weekly used_percent
+QUOTA_STOP_REVIEW = env_number("LANE_QUOTA_STOP_REVIEW", 95, low=0, high=100)         # reviews may use a little more
+QUOTA_STOP_SHORT = env_number("LANE_QUOTA_STOP_SHORT", 98, low=0, high=100)           # any shorter window (e.g. 5h) near its cap
+WEEKLY_LANE_POINTS = env_number("LANE_WEEKLY_POINTS", 0, low=0)             # optional cap on task-lane quota use per account per week; 0 = off
+WEEK_MINUTES = 10080
+STARTUP_GRACE_S = 60
+KILL_GRACE_S = 10
+CAPPED_HOLD_S = 6 * 3600   # after a worker hits a usage limit, refuse new lanes on that account this long
+SUMMARY_CHARS = 1500
+PROFILES_PATH = Path(os.environ.get("LANE_PROFILES", Path(__file__).resolve().parent / "profiles.json"))
+
+DEV_INSTRUCTIONS = """You are a bounded worker launched by the `lane` tool. Do only the task in the brief.
+Stay inside the working directory and any owned paths the brief lists. Do not spawn agents, start workflows,
+launch nested Codex, or write planning files of your own. Do not use broker, trading or payment tools.
+Your final message is your report and is read by a machine: follow the output contract at the end of the brief."""
+
+CONTRACTS = {
+    "task": "\n\n---\nOUTPUT CONTRACT (required): the first line of your final message is exactly `STATUS: DONE` or "
+            "`STATUS: BLOCKED`. Then at most 150 words: what changed (files), the acceptance command you ran and its "
+            "result, and anything left open.",
+    "review": "\n\n---\nOUTPUT CONTRACT (required): the first line of your final message is exactly `VERDICT: LGTM` or "
+              "`VERDICT: REVISE`. Then numbered findings (most severe first), each with file:line, what is wrong, "
+              "and the fix. No praise, no summary of the change.",
+}
+MARKER = {"task": re.compile(r"STATUS: (DONE|BLOCKED)"), "review": re.compile(r"VERDICT: (LGTM|REVISE)")}  # fullmatch on line 1
+PROVIDERS = ("openai", "deepseek", "spark", "claude")
+SANDBOXES = ("read-only", "workspace-write")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+PROFILE_FIELDS = ("model", "effort", "kind", "sandbox", "max_time")
+
+
+class UsageError(Exception):
+    pass
+
+
+class JsonArgParser(argparse.ArgumentParser):
+    def error(self, message):  # keep the one-JSON-line contract for bad arguments too
+        raise UsageError(message)
+
+
+# ---------- small helpers ----------
+
+def emit(obj: dict, code: int = 0) -> int:
+    print(json.dumps(obj, sort_keys=True))
+    return code
+
+
+def write_json(path: Path, data: dict) -> None:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def group_alive(pgid: int | None) -> bool:
+    """True while any live member of the group exists. macOS answers EPERM for a group holding only zombies."""
+    if not pgid:
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def stop_group(pgid: int, reap=lambda: None) -> bool:
+    """TERM a process group, then KILL whatever is left; True once no member is alive. Survivors of a dead
+    leader count too. `reap` collects our own exited leader first, so a zombie leader doesn't look alive."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        reap()
+        if not group_alive(pgid):
+            return True
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return not group_alive(pgid)
+        deadline = time.time() + KILL_GRACE_S
+        while time.time() < deadline:
+            reap()
+            if not group_alive(pgid):
+                return True
+            time.sleep(0.2)
+    return not group_alive(pgid)
+
+
+def parse_duration(value: str) -> float:
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smh]?)", str(value).strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid duration: {value}")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+def new_id(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:24] or "lane"
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}-{os.urandom(2).hex()}"
+
+
+def keychain(service: str) -> str:
+    try:
+        out = subprocess.run(["/usr/bin/security", "find-generic-password", "-a", os.environ.get("USER", ""),
+                              "-s", service, "-w"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def git(cwd: str | Path, *args: str) -> str | None:
+    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def overlaps(a: str, b: str) -> bool:
+    return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
+
+
+def capped_marker(codex_home: str, provider: str) -> Path:
+    return Path(codex_home) / ("CAPPED" if provider == "openai" else f"CAPPED-{provider}")
+
+
+# ---------- quota telemetry (rollout token_count events; limit_id "codex" only) ----------
+
+def account_homes(codex_home: str) -> list[str]:
+    """The lane home plus the home its auth.json links to: same account, so the same weekly quota."""
+    homes = [codex_home]
+    auth = Path(codex_home) / "auth.json"
+    if auth.is_symlink():
+        target = str(auth.resolve().parent)
+        if target not in homes:
+            homes.append(target)
+    return homes
+
+
+def account_id(codex_home: str) -> str:
+    """Where the account's real auth.json lives. Homes that share a login share one weekly quota."""
+    return str((Path(codex_home) / "auth.json").resolve().parent)
+
+
+def split_windows(rl: dict) -> tuple[dict | None, dict | None]:
+    """Return (weekly, shorter) windows. A window without window_minutes is treated as weekly."""
+    weekly = short = None
+    for w in (rl.get("primary"), rl.get("secondary")):
+        if not isinstance(w, dict):
+            continue
+        if w.get("window_minutes") in (None, WEEK_MINUTES):
+            weekly = weekly or w
+        else:
+            short = short or w
+    return weekly, short
+
+
+def latest_rate_limit(codex_home: str, since: float = 0.0) -> dict | None:
+    """The account's newest weekly reading and newest shorter-window reading, each from its own latest sample."""
+    files = []
+    for h in account_homes(codex_home):
+        files += glob.glob(os.path.join(h, "sessions", "**", "rollout-*.jsonl"), recursive=True)
+    files = sorted(files, key=lambda p: os.path.getmtime(p), reverse=True)[:25]
+    weekly = short = None              # (timestamp, window, plan_type)
+    for path in files:
+        if os.path.getmtime(path) < since:
+            break
+        try:
+            with open(path, errors="replace") as fh:
+                for line in fh:
+                    if '"token_count"' not in line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    rl = (ev.get("payload") or {}).get("rate_limits") or {}
+                    if rl.get("limit_id") != "codex":
+                        continue
+                    ts = ev.get("timestamp", "")
+                    w, sh = split_windows(rl)
+                    if w and (weekly is None or ts > weekly[0]):
+                        weekly = (ts, w, rl.get("plan_type"))
+                    if sh and (short is None or ts > short[0]):
+                        short = (ts, sh, rl.get("plan_type"))
+        except OSError:
+            continue
+    if not weekly and not short:
+        return None
+    ts, w, plan = weekly or (short[0], {}, short[2])
+    sample = {"used_percent": w.get("used_percent"), "resets_at": w.get("resets_at"), "plan_type": plan, "ts": ts}
+    if short:
+        sample["short_used_percent"] = short[1].get("used_percent")
+        sample["short_resets_at"] = short[1].get("resets_at")
+    return sample
+
+
+def lane_points_this_window(codex_home: str, resets_at: float | None) -> float:
+    """Sum of attributed quota deltas recorded by task lanes on this account inside the current weekly window."""
+    if not resets_at:
+        return 0.0
+    window_start = resets_at - WEEK_MINUTES * 60
+    me = account_id(codex_home)
+    total = 0.0
+    for res in RUNS.glob("*/result.json"):
+        r = read_json(res) or {}
+        if r.get("kind") != "task" or not r.get("codex_home") or account_id(r["codex_home"]) != me:
+            continue
+        if (r.get("finished_at") or 0) >= window_start and isinstance(r.get("quota_delta"), (int, float)):
+            total += max(0.0, r["quota_delta"])
+    return round(total, 2)
+
+
+def preflight_refusal(provider: str, kind: str, codex_home: str, quota: dict | None) -> dict | None:
+    """Why this lane can't start now (a recent usage-limit hit, or the account near its limit), or None."""
+    marker = capped_marker(codex_home, provider)
+    if marker.exists() and time.time() - marker.stat().st_mtime < CAPPED_HOLD_S:
+        return {"status": "capped_preflight", "marker": str(marker), "note": marker.read_text()[:300]}
+    if provider == "claude":
+        util = claude_weekly_utilization()
+        if util is not None and util >= CLAUDE_WEEKLY_STOP:
+            return {"status": "capped_preflight", "provider": "claude", "seven_day_utilization": util,
+                    "stop_at": CLAUDE_WEEKLY_STOP}
+    if not quota:
+        return None
+    now = time.time()
+    short = quota.get("short_used_percent")
+    if isinstance(short, (int, float)) and short >= QUOTA_STOP_SHORT and (quota.get("short_resets_at") or 0) > now:
+        return {"status": "capped_preflight", "short_used_percent": short, "resets_at": quota.get("short_resets_at")}
+    if (quota.get("resets_at") or 0) <= now:
+        return None                     # the weekly sample predates the current window
+    used = quota.get("used_percent") or 0
+    stop = QUOTA_STOP_REVIEW if kind == "review" else QUOTA_STOP_TASK
+    if used >= stop:
+        return {"status": "capped_preflight", "used_percent": used, "stop_at": stop, "resets_at": quota.get("resets_at")}
+    if kind == "task" and WEEKLY_LANE_POINTS > 0:
+        spent = lane_points_this_window(codex_home, quota.get("resets_at"))
+        if spent >= WEEKLY_LANE_POINTS:
+            return {"status": "budget_spent", "lane_points": spent, "budget": WEEKLY_LANE_POINTS,
+                    "resets_at": quota.get("resets_at")}
+    return None
+
+
+# ---------- reservations ----------
+
+def is_live(s: dict) -> bool:
+    if s.get("state") not in ("starting", "running"):
+        return False
+    if alive(s.get("supervisor_pid")) or group_alive(s.get("codex_pgid")):
+        return True
+    return s.get("state") == "starting" and time.time() - (s.get("created_at") or 0) < STARTUP_GRACE_S
+
+
+def running_lanes() -> list[dict]:
+    return [s for st in RUNS.glob("*/status.json") if is_live(s := (read_json(st) or {}))]
+
+
+# ---------- profiles and routing (deterministic; no model tokens) ----------
+
+def checked_profile_file(path: Path, data) -> dict:
+    """A profiles file's top level must be objects all the way down to the profile entries."""
+    if not isinstance(data, dict) or any(not isinstance(data.get(k, {}), dict) for k in ("profiles", "ladder", "keywords")):
+        raise ValueError(f"{path}: expected an object with profiles, ladder and keywords objects")
+    return data
+
+
+def load_profiles(cwd: str | Path | None = None) -> dict:
+    """Global profiles.json, then <repo>/.lane/profiles.json on top (per-project overrides of whole profiles)."""
+    raw = PROFILES_PATH.read_bytes()
+    data = checked_profile_file(PROFILES_PATH, json.loads(raw))
+    repo = git(cwd, "rev-parse", "--show-toplevel") if cwd else None
+    local = Path(repo) / ".lane" / "profiles.json" if repo else None
+    if local and local.is_file():
+        over = checked_profile_file(local, json.loads(local.read_text()))
+        for section in ("profiles", "ladder", "keywords"):
+            data.setdefault(section, {}).update(over.get(section, {}))
+        data["project_overrides"] = str(local)
+        raw += local.read_bytes()
+    data["hash"] = "sha256:" + hashlib.sha256(raw).hexdigest()[:16]
+    return data
+
+
+def brief_signals(text: str, keywords: dict) -> dict:
+    """Countable facts about a brief written to the lane-routing template (Goal / Owned paths / Read / Do)."""
+    def items(label: str) -> list[str]:
+        m = re.search(rf"^[ \t]*(?:.*?\.[ \t]*)?{label}:[ \t]*(.*)$", text, re.M | re.I)
+        if not m:
+            return []
+        value = m.group(1)
+        if not value.strip():          # the list may follow as "- item" lines
+            bullets = re.match(r"(?:[ \t]*[-*][ \t]+.+(?:\n|$))+", text[m.end() + 1:])
+            found = [b.strip()[1:].strip() for b in bullets.group(0).splitlines()] if bullets else []
+            return [x for x in found if x and not re.fullmatch(r"(none|n/a|-)\.?", x, re.I)]
+        if re.fullmatch(r"\s*(none|n/a|-)?\s*\.?\s*", value, re.I):
+            return []
+        return [x for x in re.split(r"[,;]\s*|\s+and\s+", value.strip().rstrip(".")) if x.strip()]
+    goal = " ".join(re.findall(r"^[ \t]*Goal:[ \t]*(.+)$", text, re.M | re.I))
+    do_block = re.search(r"^\s*Do:\s*\n?(.*?)(?=^\s*(Acceptance|Read|Goal|Repo)\b|\Z)", text, re.M | re.S | re.I)
+    do_text = do_block.group(1) if do_block else ""
+    do_steps = len(re.findall(r"^\s*\d+[.)]\s", do_text, re.M))
+    scope = f"{goal}\n{do_text}".lower()
+    hits = {k: sorted({w for w in words if re.search(rf"\b{re.escape(w)}\b", scope)}) for k, words in keywords.items()}
+    return {"owned_paths": len(items("Owned paths")), "read_files": len(items("Read")), "do_steps": do_steps,
+            "brief_bytes": len(text.encode()), "hard_kw": hits.get("hard", []), "simple_kw": hits.get("simple", []),
+            "draft_kw": hits.get("draft", []), "risk_kw": hits.get("risk", [])}
+
+
+def profile_problem(prof: dict) -> str | None:
+    """Why a profile can't be used, or None. Profiles bypass argparse, so check what argparse would have."""
+    if not isinstance(prof, dict):
+        return "a profile must be a JSON object"
+    missing = [f for f in PROFILE_FIELDS if f not in prof]
+    if missing:
+        return f"missing {', '.join(missing)}"
+    if not isinstance(prof["model"], str) or not prof["model"].strip():
+        return "model must be a non-empty string"
+    for field in ("worktree", "enabled"):
+        if field in prof and not isinstance(prof[field], bool):
+            return f"{field} must be true or false, not {prof[field]!r}"
+    for field, allowed in (("kind", tuple(CONTRACTS)), ("sandbox", SANDBOXES), ("provider", PROVIDERS),
+                           ("effort", EFFORTS)):
+        if field in prof and prof[field] not in allowed:
+            return f"{field} must be one of {', '.join(allowed)}, not {prof[field]!r}"
+    try:
+        parse_duration(prof["max_time"])
+    except argparse.ArgumentTypeError as exc:
+        return str(exc)
+    return None
+
+
+def auto_profile(kind: str, sandbox: str, sig: dict) -> tuple[str | None, str | None]:
+    """Rule table (family first, then tier). Returns (profile, refusal)."""
+    hard, simple, risk = len(sig["hard_kw"]), len(sig["simple_kw"]), len(sig["risk_kw"])
+    if kind == "review":
+        deep = risk >= 1 or hard >= 2 or sig["brief_bytes"] > 12000
+        return ("review-deep" if deep else "review"), None
+    if sandbox == "workspace-write":
+        if sig["owned_paths"] == 0:
+            return None, "owned_paths_missing"
+        if risk >= 1:
+            return None, "explicit_profile_required"
+        hard_impl = sig["owned_paths"] >= 4 or hard >= 2 or sig["do_steps"] > 6 or sig["brief_bytes"] > 4096
+        if hard_impl:
+            return "implement-hard", None
+        light = simple >= 1 and hard == 0 and sig["owned_paths"] <= 2 and sig["brief_bytes"] < 2000
+        return ("implement-light" if light else "implement"), None
+    if sig["draft_kw"] and hard == 0:
+        return "draft", None
+    quick = simple >= 1 and hard == 0 and sig["read_files"] <= 2 and sig["brief_bytes"] < 1500
+    return ("quick-investigate" if quick else "investigate"), None
+
+
+def resolve_route(a: argparse.Namespace, brief_text: str) -> tuple[dict | None, dict | None]:
+    """Fill model/effort/kind/sandbox/worktree/max_time on `a` from --profile / --retry-of. Returns (routing, error)."""
+    routing = {"mode": None, "profile": None, "decided_by": "flags", "overrides": []}
+    name = a.profile
+    if a.retry_of:
+        prev = read_json(RUNS / a.retry_of / "result.json") or {}
+        prof = prev.get("profile")
+        if not prof:
+            return None, {"status": "usage_error", "error": f"--retry-of {a.retry_of}: no profile recorded"}
+        nxt = load_profiles(a.cwd)["ladder"].get(prof)
+        if nxt in (None, "claude_agent"):
+            return None, {"status": "escalate_to_claude", "from_profile": prof,
+                          "note": "no stronger lane profile; run this stage as a Claude agent"}
+        name, routing["decided_by"] = nxt, "retry"
+    if not name:
+        a.provider = a.provider or "openai"
+        a.model = a.model or "gpt-6-astra"
+        a.effort = a.effort or "medium"
+        a.kind = a.kind or "task"
+        a.sandbox = a.sandbox or "read-only"
+        a.max_time = a.max_time if a.max_time is not None else parse_duration("60m")
+        return routing, None
+    data = load_profiles(a.cwd)
+    routing.update(mode="auto" if name == "auto" else "named", profile_set_hash=data["hash"],
+                   project_overrides=data.get("project_overrides"))
+    if name == "auto":
+        a.kind = a.kind or "task"
+        a.sandbox = a.sandbox or "read-only"
+        sig = brief_signals(brief_text, data.get("keywords", {}))
+        name, refusal = auto_profile(a.kind, a.sandbox, sig)
+        routing.update(signals=sig, decided_by="rules")
+        if refusal:
+            return None, {"status": refusal, "signals": sig,
+                          "note": "name a profile explicitly" if refusal == "explicit_profile_required" else "list Owned paths in the brief"}
+    elif routing["decided_by"] != "retry":
+        routing["decided_by"] = "explicit"
+    prof = data["profiles"].get(name)
+    if prof is None:
+        return None, {"status": "unknown_profile", "profile": name, "known": sorted(data["profiles"])}
+    problem = profile_problem(prof)
+    if problem:
+        return None, {"status": "bad_profile", "profile": name, "error": problem}
+    if prof.get("enabled") is False:
+        return None, {"status": "profile_disabled", "profile": name}
+    wanted = dict(prof, provider=prof.get("provider", "openai"))
+    for field in ("provider", "model", "effort", "kind", "sandbox"):
+        given = getattr(a, field)
+        if given is not None and given != wanted[field] and not (routing["mode"] == "auto" and field in ("kind", "sandbox")):
+            routing["overrides"].append(field)
+        setattr(a, field, given if given is not None else wanted[field])
+    if a.max_time is None:
+        a.max_time = parse_duration(prof["max_time"])
+    else:
+        routing["overrides"].append("max_time")
+    if prof.get("worktree"):
+        a.worktree = True
+    routing["profile"] = name
+    return routing, None
+
+
+# ---------- codex argv ----------
+
+SECRET_ENV = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|CREDENTIAL|PRIVATE_KEY|SESSION_KEY|AUTH)", re.I)
+
+
+def worker_env() -> dict:
+    """The caller's environment minus Claude session variables and anything secret-looking. Workers get their own
+    credentials only through CODEX_HOME (or the provider key lane adds explicitly)."""
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith(("CLAUDE_", "CLAUDECODE", "ANTHROPIC_", "OPENAI_API", "MCP_")) and not SECRET_ENV.search(k)}
+
+
+def repo_rules(cwd: str) -> str:
+    """The repo's own instruction files, since a lean claude -p run doesn't load them."""
+    root = git(cwd, "rev-parse", "--show-toplevel") or cwd
+    parts = []
+    for name in ("CLAUDE.md", "AGENTS.md", ".claude/CLAUDE.md"):
+        f = Path(root) / name
+        if f.is_file():
+            parts.append(f"## {f}\n{f.read_text(errors='replace')[:20000]}")
+    return "\n\n".join(parts)
+
+
+def build_claude_argv(p: dict, run: Path) -> tuple[list[str], dict]:
+    sysfile = run / "system.md"
+    rules = repo_rules(p.get("rules_cwd") or p["cwd"])
+    sysfile.write_text(DEV_INSTRUCTIONS + ("\n\nRepository rules (follow them):\n\n" + rules if rules else "") + "\n")
+    write = p["sandbox"] == "workspace-write"
+    argv = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose",
+            "--model", p["model"], "--effort", p["effort"], "--max-turns", str(CLAUDE_MAX_TURNS),
+            "--setting-sources", "project,local", "--strict-mcp-config", "--disable-slash-commands",
+            "--append-system-prompt-file", str(sysfile),
+            "--disallowedTools", "Bash(git push:*)", "Bash(gh:*)", "Bash(git remote:*)", "WebFetch", "WebSearch"]
+    if write:
+        argv += ["--permission-mode", "acceptEdits", "--tools", "Read,Grep,Glob,Edit,Write,Bash",
+                 "--allowedTools", "Bash"]
+    else:
+        argv += ["--permission-mode", "dontAsk", "--tools", "Read,Grep,Glob,Bash",
+                 "--allowedTools", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(ls:*)", "Bash(cat:*)"]
+    for d in p["add_dir"] + ([p["git_dir"]] if p.get("git_dir") else []):
+        argv += ["--add-dir", d]
+    env = worker_env()
+    env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    return argv, env
+
+
+def parse_claude_events(path: Path) -> dict:
+    info = {"thread_id": None, "last_agent_message": None, "fatal": None, "usage": {}, "model": None, "rate": None, "error": None}
+    try:
+        fh = path.open(errors="replace")
+    except OSError:
+        return info
+    with fh:
+        for line in fh:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            t = ev.get("type")
+            if t == "system" and ev.get("subtype") == "init":
+                info["model"] = ev.get("model")
+                info["thread_id"] = ev.get("session_id")
+            elif t == "rate_limit_event":
+                info["rate"] = ev.get("rate_limit_info") or ev
+            elif t == "assistant":
+                if ev.get("error"):
+                    info["error"] = ev.get("error")
+                for b in (ev.get("message") or {}).get("content", []) or []:
+                    if b.get("type") == "text":
+                        info["last_agent_message"] = b.get("text")
+            elif t == "result":
+                info["thread_id"] = ev.get("session_id") or info["thread_id"]
+                if ev.get("result"):
+                    info["last_agent_message"] = ev.get("result")
+                if ev.get("is_error"):
+                    info["fatal"] = f'{ev.get("subtype")}: {ev.get("terminal_reason") or ""} {str(ev.get("result") or "")[:300]}'
+                info["usage"] = ev.get("usage") or {}
+    return info
+
+
+def claude_weekly_utilization() -> float | None:
+    q = read_json(CLAUDE_QUOTA_FILE) or {}
+    if (q.get("seven_day_resets_at") or 0) and q["seven_day_resets_at"] < time.time():
+        return None
+    return q.get("seven_day")
+
+
+def record_claude_rate(rate: dict | None) -> None:
+    if not rate:
+        return
+    windows = rate.get("unifiedWindows") or {}
+    seven = (windows.get("seven_day") or {}) if windows else ({} if rate.get("rateLimitType") != "seven_day" else rate)
+    util, resets = seven.get("utilization"), seven.get("resetsAt")
+    if util is None:
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / "claude-quota.lock").open("a+") as lock:   # concurrent finishers must not lose a higher reading
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        old = read_json(CLAUDE_QUOTA_FILE) or {}
+        old_resets = old.get("seven_day_resets_at")
+        if isinstance(resets, (int, float)) and isinstance(old_resets, (int, float)):
+            if resets < old_resets - 3600:
+                return                     # a late reading from a window that has since reset
+            if resets <= old_resets + 3600:
+                util = max(util, old.get("seven_day") or 0)   # same window: lanes finish out of order
+        write_json(CLAUDE_QUOTA_FILE, {"seven_day": util, "seven_day_resets_at": resets,
+                                       "five_hour": (windows.get("five_hour") or {}).get("utilization"), "ts": time.time()})
+
+def build_argv(p: dict, final_path: Path) -> tuple[list[str], dict]:
+    argv = [CODEX_BIN, "exec", "--ignore-user-config", "--skip-git-repo-check",
+            "--disable", "hooks", "--disable", "multi_agent", "--disable", "context_management", "--disable", "apps",
+            "--json", "--output-last-message", str(final_path),
+            "-m", p["model"], "-c", f"model_reasoning_effort={json.dumps(p['effort'])}",
+            "-c", 'approval_policy="never"',
+            "-c", f"developer_instructions={json.dumps(DEV_INSTRUCTIONS)}",
+            "-c", "shell_environment_policy.experimental_use_profile=false",
+            "-c", 'shell_environment_policy.inherit="all"',
+            "-c", f"shell_environment_policy.set.PATH={json.dumps(os.environ.get('PATH', ''))}",
+            "-s", p["sandbox"], "-C", p["cwd"]]
+    env = worker_env()
+    env["CODEX_HOME"] = p["codex_home"]
+    if p["provider"] == "openai" and p["tier"] != "default":
+        argv += ["-c", f"service_tier={json.dumps(p['tier'])}"]
+    if p["provider"] == "deepseek":
+        # EXPERIMENTAL: DeepSeek through Codex's Responses API. Key from DEEPSEEK_API_KEY or the Keychain item
+        # deepseek-api-key, passed to the child env only.
+        key = os.environ.get("DEEPSEEK_API_KEY") or keychain("deepseek-api-key")
+        if not key:
+            raise UsageError("deepseek provider needs Keychain item deepseek-api-key")
+        env["DEEPSEEK_API_KEY"] = key
+        argv += ["-c", 'model_provider="deepseek"', "-c", 'model_providers.deepseek.name="DeepSeek"',
+                 "-c", 'model_providers.deepseek.base_url="https://api.deepseek.com/"',
+                 "-c", 'model_providers.deepseek.env_key="DEEPSEEK_API_KEY"',
+                 "-c", "model_providers.deepseek.requires_openai_auth=false",
+                 "-c", 'model_providers.deepseek.wire_api="responses"',
+                 "-c", "model_providers.deepseek.supports_websockets=false",
+                 "-c", "model_providers.deepseek.request_max_retries=3",
+                 "-c", "model_providers.deepseek.stream_max_retries=3"]
+        catalog = os.environ.get("LANE_DEEPSEEK_CATALOG", "")
+        if catalog and Path(catalog).expanduser().exists():
+            argv += ["-c", f"model_catalog_json={json.dumps(str(Path(catalog).expanduser()))}"]
+    if p["provider"] == "spark":
+        # EXPERIMENTAL, never exercised: vLLM on the DGX Spark via the Responses API.
+        base = os.environ.get("LANE_SPARK_BASE_URL", "")
+        service = os.environ.get("LANE_SPARK_KEYCHAIN_SERVICE", "")
+        key = keychain(service) if service else ""
+        if not base or not key:
+            raise UsageError("spark provider needs LANE_SPARK_BASE_URL and LANE_SPARK_KEYCHAIN_SERVICE (Keychain)")
+        env["LANE_SPARK_KEY"] = key
+        argv += ["-c", 'model_provider="spark"', "-c", 'model_providers.spark.name="DGX Spark vLLM"',
+                 "-c", f"model_providers.spark.base_url={json.dumps(base)}",
+                 "-c", 'model_providers.spark.env_key="LANE_SPARK_KEY"',
+                 "-c", "model_providers.spark.requires_openai_auth=false",
+                 "-c", 'model_providers.spark.wire_api="responses"',
+                 "-c", "model_providers.spark.supports_websockets=false",
+                 "-c", "model_providers.spark.request_max_retries=0",
+                 "-c", "model_providers.spark.stream_max_retries=0"]
+    if p["network"]:
+        argv += ["-c", "sandbox_workspace_write.network_access=true"]
+    for d in p["add_dir"] + ([p["git_dir"]] if p.get("git_dir") else []):
+        argv += ["--add-dir", d]
+    argv.append("-")
+    return argv, env
+
+
+# ---------- classification ----------
+
+def parse_events(path: Path) -> dict:
+    info = {"thread_id": None, "last_agent_message": None, "fatal": None, "usage": {}}
+    try:
+        fh = path.open(errors="replace")
+    except OSError:
+        return info
+    with fh:
+        for line in fh:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            t = ev.get("type")
+            if t == "thread.started":
+                info["thread_id"] = ev.get("thread_id")
+            elif t == "item.completed" and (ev.get("item") or {}).get("type") == "agent_message":
+                info["last_agent_message"] = ev["item"].get("text")
+            elif t == "turn.failed":
+                info["fatal"] = ((ev.get("error") or {}).get("message")) or "turn.failed"
+            elif t == "turn.completed":
+                for k, v in (ev.get("usage") or {}).items():
+                    if isinstance(v, (int, float)):
+                        info["usage"][k] = info["usage"].get(k, 0) + v
+    return info
+
+
+def first_line(text: str) -> str:
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip().strip("*").strip()
+    return ""
+
+
+def classify(rc: int | None, timed_out: bool, cancelled: bool, ev: dict, final_text: str, stderr_tail: str,
+             kind: str) -> str:
+    blob = f"{ev.get('fatal') or ''}\n{stderr_tail}".lower()
+    if "hit your session limit" in blob or "hit your weekly limit" in blob:
+        blob += " usage limit"
+    if cancelled:
+        return "cancelled"
+    if timed_out:
+        return "timeout"
+    if "usage limit" in blob or "usage_limit" in blob:
+        return "capped"
+    if re.search(r"\b401\b", blob) or "unauthorized" in blob or "invalid api key" in blob:
+        return "auth_401"
+    if rc not in (0, None) or ev.get("fatal"):
+        return "error"
+    if not final_text.strip():
+        return "no_report"
+    if not MARKER[kind].fullmatch(first_line(final_text)):
+        return "contract_violation"
+    return "ok"
+
+
+def rollout_facts(codex_home: str, thread_id: str | None) -> dict:
+    facts = {"model_verified": None, "effort_recorded": None, "rollout": None}
+    if not thread_id:
+        return facts
+    hits = glob.glob(os.path.join(codex_home, "sessions", "**", f"rollout-*{thread_id}.jsonl"), recursive=True)
+    if not hits:
+        return facts
+    facts["rollout"] = hits[0]
+    try:
+        with open(hits[0], errors="replace") as fh:
+            for line in fh:
+                if '"turn_context"' not in line:
+                    continue
+                p = (json.loads(line).get("payload") or {})
+                facts["model_verified"] = p.get("model")
+                facts["effort_recorded"] = p.get("effort") or ((p.get("collaboration_mode") or {}).get("settings") or {}).get("reasoning_effort")
+                break
+    except (OSError, ValueError):
+        pass
+    return facts
+
+
+def overlapping_lanes(run: Path, codex_home: str, start: float, end: float) -> int:
+    """Other lanes on the same account whose run interval overlaps this one (for splitting account-wide deltas)."""
+    me = account_id(codex_home)
+    n = 0
+    for st in RUNS.glob("*/status.json"):
+        if st.parent == run:
+            continue
+        s = read_json(st) or {}
+        p = read_json(st.parent / "params.json") or {}
+        if p.get("provider") != "openai" or not p.get("codex_home") or account_id(p["codex_home"]) != me:
+            continue
+        s0, s1 = s.get("started_at"), s.get("finished_at") or time.time()
+        if s0 and s0 < end and s1 > start:
+            n += 1
+    return n
+
+
+# ---------- supervisor (runs detached; the only writer of status.json after launch) ----------
+
+def supervise(lane_id: str) -> int:
+    run = RUNS / lane_id
+    p = read_json(run / "params.json")
+    status = read_json(run / "status.json")
+    if not p or not status:
+        return 1
+    status["supervisor_pid"] = os.getpid()
+    write_json(run / "status.json", status)
+    final_path, events_path, stderr_path = run / "final.md", run / "events.jsonl", run / "stderr.log"
+    for f in (final_path, events_path, stderr_path):
+        f.unlink(missing_ok=True)
+    started = time.time()
+    if (run / "cancel").exists():
+        return finish(run, p, status, rc=None, timed_out=False, cancelled=True, started=started)
+    try:
+        argv, env = build_claude_argv(p, run) if p["provider"] == "claude" else build_argv(p, final_path)
+    except UsageError as exc:
+        return finish(run, p, status, rc=None, timed_out=False, cancelled=False, started=started, setup_error=str(exc))
+    write_json(run / "argv.json", {"argv": argv})
+    if (run / "cancel").exists():      # a cancel may land while build_argv waits on Keychain
+        return finish(run, p, status, rc=None, timed_out=False, cancelled=True, started=started)
+    with (run / "brief.md").open("rb") as stdin, events_path.open("wb") as out, stderr_path.open("wb") as err:
+        try:
+            proc = subprocess.Popen(argv, cwd=p["cwd"], stdin=stdin, stdout=out, stderr=err, env=env,
+                                    start_new_session=True)
+        except FileNotFoundError:
+            return finish(run, p, status, rc=None, timed_out=False, cancelled=False, started=started,
+                          setup_error=f"{argv[0]} not found")
+        timed_out = cancelled = False
+        try:
+            status.update(state="running", codex_pid=proc.pid, codex_pgid=proc.pid, started_at=started)
+            write_json(run / "status.json", status)
+            deadline = started + p["max_time_s"]
+            while proc.poll() is None:
+                if (run / "cancel").exists():
+                    cancelled = True
+                    break
+                if time.time() >= deadline:
+                    timed_out = True
+                    break
+                time.sleep(1)
+            if p["provider"] == "claude" and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGINT)   # claude -p records a result on SIGINT, not on SIGTERM
+                    proc.wait(timeout=KILL_GRACE_S)
+                except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
+                    pass
+        finally:
+            stopped = stop_group(proc.pid, reap=proc.poll)   # also stops descendants left behind after a normal exit
+        try:
+            proc.wait(timeout=KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            pass
+    return finish(run, p, status, rc=proc.returncode, timed_out=timed_out, cancelled=cancelled, started=started,
+                  setup_error="" if stopped else STUCK_GROUP, stuck=not stopped)
+
+
+STUCK_GROUP = "worker process group survived SIGKILL; its write roots stay reserved until it exits"
+
+
+def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: bool, started: float,
+           setup_error: str = "", stuck: bool = False) -> int:
+    is_claude = p["provider"] == "claude"
+    ev = parse_claude_events(run / "events.jsonl") if is_claude else parse_events(run / "events.jsonl")
+    if is_claude:
+        record_claude_rate(ev.get("rate"))
+        if ev.get("error") in ("rate_limit",) and not ev.get("fatal"):
+            ev["fatal"] = "usage limit (claude rate_limit)"
+        if ev.get("error") in ("authentication_failed", "oauth_org_not_allowed", "account_on_hold") and not ev.get("fatal"):
+            ev["fatal"] = "401 unauthorized (claude)"
+    final_path = run / "final.md"
+    final_text = final_path.read_text(errors="replace") if final_path.exists() and final_path.stat().st_mtime >= started - 1 else ""
+    if not final_text.strip() and ev.get("last_agent_message"):
+        final_text = ev["last_agent_message"]          # -o missed: fall back to the last agent message in the stream
+        final_path.write_text(final_text)
+    try:
+        stderr_tail = (run / "stderr.log").read_text(errors="replace")[-4000:]
+    except OSError:
+        stderr_tail = ""
+    state = "error" if setup_error else classify(rc, timed_out, cancelled, ev, final_text, stderr_tail, p["kind"])
+    facts = ({"model_verified": ev.get("model"), "effort_recorded": None, "rollout": None} if is_claude
+             else rollout_facts(p["codex_home"], ev.get("thread_id")))
+    after = latest_rate_limit(p["codex_home"], since=started - 5) if p["provider"] == "openai" else None
+    before = p.get("quota_before") or {}
+    ended = time.time()
+    raw_delta = delta = None
+    overlap = 0
+    if after and isinstance(before.get("used_percent"), (int, float)) and before.get("resets_at") == after.get("resets_at"):
+        raw_delta = round(after["used_percent"] - before["used_percent"], 2)
+        overlap = overlapping_lanes(run, p["codex_home"], started, ended)
+        delta = round(raw_delta / (1 + overlap), 2)     # approximate: the account delta is shared by overlapping lanes
+    if state == "capped":
+        try:
+            capped_marker(p["codex_home"], p["provider"]).write_text(
+                f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {(ev.get('fatal') or '')[:300]}\n")
+        except OSError:
+            pass
+    head = first_line(final_text or "")
+    result = {
+        "lane_id": run.name, "status": state, "kind": p["kind"], "label": p["label"],
+        "provider": p["provider"], "model": p["model"], "effort": p["effort"],
+        "model_verified": facts["model_verified"], "effort_recorded": facts["effort_recorded"],
+        "codex_home": p["codex_home"], "cwd": p["cwd"], "worktree": p.get("worktree"), "branch": p.get("branch"),
+        "session_id": ev.get("thread_id"), "exit_code": rc, "duration_s": round(ended - started, 1),
+        "tokens": ev.get("usage") or None, "report_path": str(final_path) if final_text else None,
+        "marker": head if MARKER[p["kind"]].fullmatch(head) else None, "report_words": len((final_text or "").split()),
+        "summary": "\n".join(x for x in (setup_error, final_text or ev.get("fatal") or
+                                         (stderr_tail.strip() if state != "ok" else "")) if x)[:SUMMARY_CHARS],
+        "quota_before": before.get("used_percent"), "quota_after": (after or {}).get("used_percent"),
+        "quota_delta_raw": raw_delta, "quota_delta": delta, "overlapping_lanes": overlap,
+        "run_dir": str(run), "finished_at": ended,
+        "profile": p.get("profile"), "routing": p.get("routing"),
+    }
+    write_json(run / "result.json", result)
+    # a stuck group stays "running" so is_live() keeps its reservation while any member is alive
+    status.update(state="running" if stuck else "done", result_status=state, finished_at=ended)
+    write_json(run / "status.json", status)
+    return 0
+
+
+# ---------- commands ----------
+
+def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool = False) -> int:
+    brief = Path(a.brief).expanduser().resolve()
+    cwd = Path(a.cwd).expanduser().resolve()
+    brief_text = brief.read_text(errors="replace") if brief.is_file() else ""
+    if not brief_text.strip():
+        return emit({"status": "usage_error", "error": f"brief missing or empty: {brief}"}, 2)
+    if not cwd.is_dir():
+        return emit({"status": "usage_error", "error": f"cwd not a directory: {cwd}"}, 2)
+    a.cwd = str(cwd)
+    routing, refusal = resolve_route(a, brief_text)
+    if refusal:
+        return emit(refusal, 2)
+    if route_only:
+        return emit({"status": "routed", "profile": routing.get("profile"), "provider": a.provider, "model": a.model, "effort": a.effort,
+                     "kind": a.kind, "sandbox": a.sandbox, "worktree": a.worktree, "max_time_s": a.max_time,
+                     "routing": routing})
+    add_dirs = [str(Path(d).expanduser().resolve()) for d in a.add_dir]
+    missing = [d for d in add_dirs if not Path(d).is_dir()]
+    if missing:
+        return emit({"status": "usage_error", "error": f"--add-dir not a directory: {missing}"}, 2)
+    codex_home = str(Path(a.codex_home or DEFAULT_HOME).expanduser().absolute())
+    if a.provider == "openai" and not (Path(codex_home) / "auth.json").exists():
+        return emit({"status": "usage_error", "error": f"no auth.json in {codex_home}"}, 2)
+    repo = git(cwd, "rev-parse", "--show-toplevel")
+    if a.worktree and not repo:
+        return emit({"status": "usage_error", "error": "--worktree needs cwd inside a git repo"}, 2)
+    RUNS.mkdir(parents=True, exist_ok=True)
+    lock_fh = (STATE / "lock").open("a+")
+    deadline = time.time() + a.wait_slot
+    while True:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        running = running_lanes()
+        if len(running) < MAX_CONCURRENT:
+            break
+        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        if time.time() >= deadline:
+            return emit({"status": "busy", "running": [r.get("lane_id") for r in running], "max": MAX_CONCURRENT}, 4)
+        time.sleep(5)
+    try:
+        lane_id = new_id(a.label or brief.stem)
+        worktree = branch = None
+        if a.worktree:
+            worktree = WORKTREE_ROOT / f"lane-{lane_id}"
+            branch = f"lane/{lane_id}"
+        # writable roots this lane reserves (one writer per root; overlapping roots clash)
+        write_roots: list[str] = []
+        if a.sandbox == "workspace-write":
+            write_roots = [str(worktree) if worktree else (repo or str(cwd))] + add_dirs
+            for r in running:
+                for mine in write_roots:
+                    for theirs in r.get("write_roots") or []:
+                        if overlaps(mine, theirs):
+                            return emit({"status": "busy_worktree", "error": f"{mine} overlaps {theirs}",
+                                         "running": [r.get("lane_id")]}, 4)
+        quota = latest_rate_limit(codex_home) if a.provider == "openai" else None
+        refusal = None if a.force else preflight_refusal(a.provider, a.kind, codex_home, quota)
+        if refusal:
+            return emit(refusal, 5)
+        work_cwd, git_dir = cwd, None
+        if worktree:
+            mk = subprocess.run(["git", "-C", repo, "worktree", "add", "-b", branch, str(worktree), "HEAD"],
+                                capture_output=True, text=True)
+            if mk.returncode != 0:
+                return emit({"status": "error", "error": f"git worktree add failed: {mk.stderr.strip()[:300]}"}, 1)
+        run, made_run, launched = RUNS / lane_id, False, False
+        try:
+            if worktree:
+                work_cwd = worktree / cwd.relative_to(repo)
+            if a.sandbox == "workspace-write" and repo:
+                common = git(work_cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+                if common and not overlaps(common, str(worktree or repo)):
+                    git_dir = common            # lets a worktree lane commit; not a reserved write root
+            run.mkdir(parents=True)
+            made_run = True
+            (run / "brief.md").write_text(brief_text.rstrip() + CONTRACTS[a.kind] + "\n")
+            params = {"kind": a.kind, "label": a.label or brief.stem, "provider": a.provider, "model": a.model,
+                      "effort": a.effort, "sandbox": a.sandbox, "cwd": str(work_cwd), "codex_home": codex_home,
+                      "tier": a.tier, "network": a.network, "add_dir": add_dirs, "git_dir": git_dir,
+                      "max_time_s": a.max_time, "worktree": str(worktree) if worktree else None, "branch": branch,
+                      "brief_source": str(brief), "quota_before": quota,
+                      "profile": routing.get("profile"), "routing": routing, "rules_cwd": str(cwd)}
+            write_json(run / "params.json", params)
+            # reservation is published before the supervisor exists; from here on the supervisor owns status.json
+            write_json(run / "status.json", {"lane_id": lane_id, "state": "starting", "write_roots": write_roots,
+                                             "created_at": time.time()})
+            with (run / "supervisor.log").open("ab") as slog:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__), "_supervise", lane_id],
+                                 stdin=subprocess.DEVNULL, stdout=slog, stderr=slog,
+                                 start_new_session=True, close_fds=True)
+                launched = True
+        except BaseException:
+            if not launched:                # after launch, the supervisor owns the worktree and run dir
+                undo_start(repo, worktree, branch, run if made_run else None)
+            raise
+    finally:
+        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+    if wait_after:
+        return wait_for(lane_id, params["max_time_s"] + 120)
+    return emit({"lane_id": lane_id, "status": "started", "run_dir": str(run), "model": a.model, "effort": a.effort,
+                 "codex_home": codex_home,
+                 "profile": routing.get("profile"), "routing": routing,
+                 "worktree": params["worktree"], "branch": branch, "next": f"lane wait {lane_id} --max 540"})
+
+
+def undo_start(repo: str | None, worktree: Path | None, branch: str | None, run: Path | None) -> None:
+    """Remove what a failed start created, so it leaves no worktree, branch or reservation behind."""
+    if worktree and repo:
+        git(repo, "worktree", "remove", "--force", str(worktree))
+        git(repo, "branch", "-D", branch)
+    if run:
+        shutil.rmtree(run, ignore_errors=True)
+
+
+def wait_for(lane_id: str, max_s: float) -> int:
+    run = RUNS / lane_id
+    if not run.is_dir():
+        return emit({"status": "usage_error", "error": f"unknown lane {lane_id}"}, 2)
+    deadline = time.time() + max_s
+    while True:
+        res = read_json(run / "result.json")
+        st = read_json(run / "status.json") or {}
+        if not res and not is_live(st) and st.get("state") != "done":
+            res = read_json(run / "result.json")        # it may have finished between the two reads
+            if not res:
+                return emit({"lane_id": lane_id, "status": "error", "error": "supervisor died without a result",
+                             "run_dir": str(run)}, 1)
+        if res:
+            return emit(res, 0 if res.get("status") == "ok" else 1)
+        if time.time() >= deadline:
+            return emit({"lane_id": lane_id, "status": "running", "state": st.get("state"),
+                         "elapsed_s": round(time.time() - st.get("created_at", time.time()), 1),
+                         "next": f"lane wait {lane_id} --max 540"}, 3)
+        time.sleep(0.5)
+
+
+def account_label(p: dict) -> str:
+    return "claude" if p.get("provider") == "claude" else Path(p.get("codex_home") or "").name
+
+
+def human() -> bool:
+    return sys.stdout.isatty() and os.environ.get("LANE_JSON") != "1"
+
+
+def ago(ts: float | None) -> str:
+    if not ts:
+        return "-"
+    m = int((time.time() - ts) / 60)
+    return f"{m}m ago" if m < 60 else f"{m // 60}h{m % 60:02d}m ago" if m < 1440 else f"{m // 1440}d ago"
+
+
+def cmd_status(a: argparse.Namespace) -> int:
+    rows = []
+    for st in sorted(RUNS.glob("*/status.json"), reverse=True)[: (1000 if a.all else 20)]:
+        s = read_json(st) or {}
+        r = read_json(st.parent / "result.json") or {}
+        p = read_json(st.parent / "params.json") or {}
+        rows.append({"lane_id": st.parent.name, "state": s.get("state"), "status": r.get("status"),
+                     "model": r.get("model") or p.get("model"), "effort": r.get("effort") or p.get("effort"),
+                     "profile": r.get("profile") or p.get("profile"), "label": r.get("label") or p.get("label"),
+                     "account": account_label(p), "duration_s": r.get("duration_s"),
+                     "started": s.get("created_at"), "live": is_live(s), "cwd": p.get("cwd"),
+                     "report": r.get("report_path"), "summary_first_line": first_line(r.get("summary") or "")})
+    running = len(running_lanes())
+    if not human():
+        return emit({"lanes": rows, "running": running, "max": MAX_CONCURRENT})
+    print(f"{running} of {MAX_CONCURRENT} lanes running. Newest first.\n")
+    for r in rows:
+        state = "RUNNING" if r["live"] else (r["status"] or r["state"] or "?").upper()
+        took = f'{int(r["duration_s"] // 60)}m{int(r["duration_s"] % 60):02d}s' if r["duration_s"] else "-"
+        print(f'{state:<19} {r["label"] or "-":<24} {r["model"] or "-"} {r["effort"] or ""}  [{r["profile"] or "no profile"}]  '
+              f'account={r["account"] or "-"}  started {ago(r["started"])}  took {took}')
+        if r["summary_first_line"] and not r["live"]:
+            print(f'{"":<19} says: {r["summary_first_line"][:100]}')
+        print(f'{"":<19} id: {r["lane_id"]}' + (f'   report: {r["report"]}' if r["report"] else ""))
+    print("\nDetails: lane result <id>.  Live view: lane watch <id>")
+    return 0
+
+
+def describe_event(line: str, root: str = "") -> str | None:
+    """One readable line for a Codex --json or claude stream-json event, or None to skip it."""
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return None
+    t, it = ev.get("type"), ev.get("item") or {}
+
+    def short(p):
+        return p.replace(root + "/", "") if root and isinstance(p, str) else p
+    if t == "item.started" and it.get("type") == "command_execution":
+        cmd = re.sub(r"^/bin/(z|ba)?sh -lc ", "", it.get("command") or "").strip("'\"")
+        return f"  $ {cmd[:160]}"
+    if t == "item.completed" and it.get("type") == "command_execution":
+        code = it.get("exit_code")
+        if code not in (0, "0", None):
+            tail = (it.get("aggregated_output") or "").strip().splitlines()[-2:]
+            return f"    exit {code}: " + " | ".join(x[:100] for x in tail)
+        return None
+    if t == "item.completed" and it.get("type") == "file_change":
+        paths = [short(c.get("path")) for c in (it.get("changes") or []) if isinstance(c, dict)]
+        return "  edited: " + ", ".join(p for p in paths if p)[:200]
+    if t == "item.completed" and it.get("type") == "agent_message":
+        return "  says: " + " ".join((it.get("text") or "").split())[:220]
+    if t in ("error", "turn.failed"):
+        msg = ev.get("message") or (ev.get("error") or {}).get("message")
+        return f"  ERROR: {str(msg)[:200]}"
+    if t == "assistant":            # claude stream-json
+        out = []
+        for b in (ev.get("message") or {}).get("content", []) or []:
+            if b.get("type") == "text" and b.get("text", "").strip():
+                out.append("  says: " + " ".join(b["text"].split())[:220])
+            elif b.get("type") == "tool_use":
+                inp = b.get("input") or {}
+                what = inp.get("command") or inp.get("file_path") or inp.get("pattern") or ""
+                out.append(f"  {b.get('name')}: {short(str(what))[:160]}")
+        return "\n".join(out) or None
+    if t == "result":
+        return f"  finished: {ev.get('subtype')}"
+    return None
+
+
+def cmd_watch(a: argparse.Namespace) -> int:
+    """Follow one lane (or every live lane) as readable lines until it finishes. Ctrl-C to stop."""
+    offsets: dict[str, int] = {}
+    one = a.lane_id
+    if one and not (RUNS / one).is_dir():
+        print(f"unknown lane {one}")
+        return 2
+    try:
+        while True:
+            ids = [one] if one else [st.parent.name for st in RUNS.glob("*/status.json") if is_live(read_json(st) or {})]
+            if not ids and not one:
+                print("no lanes running. (lane status shows recent ones)")
+                return 0
+            for lid in sorted(ids):
+                run = RUNS / lid
+                p = read_json(run / "params.json") or {}
+                root = p.get("cwd") or ""
+                ev_path = run / "events.jsonl"
+                if lid not in offsets:
+                    offsets[lid] = 0
+                    print(f"== {p.get('label') or lid}  {p.get('model')} {p.get('effort')}  [{p.get('profile')}]  {lid}")
+                if ev_path.exists():
+                    with ev_path.open(errors="replace") as fh:
+                        fh.seek(offsets[lid])
+                        for line in fh:
+                            if not line.endswith("\n"):
+                                break
+                            offsets[lid] += len(line.encode())
+                            d = describe_event(line, root)
+                            if d:
+                                print(("[" + (p.get("label") or lid)[:18] + "] " if not one else "") + d, flush=True)
+                res = read_json(run / "result.json")
+                if one and not res and not is_live(read_json(run / "status.json") or {}):
+                    res = read_json(run / "result.json")    # it may have finished between the two reads
+                    if not res:
+                        print("== ended without a result (its supervisor died)")
+                        return 1
+                if res and one:
+                    print(f"== done: {res.get('status')}  report: {res.get('report_path')}")
+                    return 0 if res.get("status") == "ok" else 1
+            time.sleep(1.5)
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_quota(a: argparse.Namespace) -> int:
+    home = str(Path(a.codex_home or DEFAULT_HOME).expanduser().absolute())
+    q = latest_rate_limit(home) or {}
+    marker = capped_marker(home, "openai")
+    current = (q.get("resets_at") or 0) > time.time()
+    return emit({"codex_home": home, "used_percent": q.get("used_percent"), "resets_at": q.get("resets_at"),
+                 "sample_current": current, "short_used_percent": q.get("short_used_percent"),
+                 "plan_type": q.get("plan_type"), "sample_ts": q.get("ts"),
+                 "lane_points_this_window": lane_points_this_window(home, q.get("resets_at")),
+                 "lane_points_budget": WEEKLY_LANE_POINTS, "stop_task_at": QUOTA_STOP_TASK,
+                 "stop_review_at": QUOTA_STOP_REVIEW, "capped_marker": marker.read_text()[:300] if marker.exists() else None})
+
+
+def cmd_cancel(a: argparse.Namespace) -> int:
+    run = RUNS / a.lane_id
+    if not run.is_dir():
+        return emit({"status": "usage_error", "error": f"unknown lane {a.lane_id}"}, 2)
+    st = read_json(run / "status.json") or {}
+    if st.get("state") == "done":
+        return emit({"lane_id": a.lane_id, "status": "not_running"}, 1)
+    (run / "cancel").write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    pgid = st.get("codex_pgid")
+    if not alive(st.get("supervisor_pid")) and group_alive(pgid):
+        # orphaned worker: no supervisor will read the cancel request, so stop the group here
+        if not stop_group(pgid):
+            return emit({"lane_id": a.lane_id, "status": "error", "error": "worker process group survived SIGKILL",
+                         "codex_pgid": pgid}, 1)
+        return emit({"lane_id": a.lane_id, "status": "orphan_killed", "codex_pgid": pgid})
+    return emit({"lane_id": a.lane_id, "status": "cancel_requested", "next": f"lane wait {a.lane_id} --max 60"})
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = JsonArgParser(prog="lane", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True, parser_class=JsonArgParser)
+    for name in ("start", "run", "route"):
+        s = sub.add_parser(name)
+        s.add_argument("--brief", required=True)
+        s.add_argument("--cwd", required=True)
+        s.add_argument("--profile", default=None, help="profile name from profiles.json, or 'auto'")
+        s.add_argument("--retry-of", default=None, help="lane id to escalate from (next profile on the ladder)")
+        s.add_argument("--model", default=None)
+        s.add_argument("--effort", default=None, choices=EFFORTS)
+        s.add_argument("--kind", default=None, choices=("task", "review"))
+        s.add_argument("--sandbox", default=None, choices=SANDBOXES)
+        s.add_argument("--worktree", action="store_true")
+        s.add_argument("--label", default="")
+        s.add_argument("--max-time", default=None, type=parse_duration)
+        s.add_argument("--provider", default=None, choices=PROVIDERS)
+        s.add_argument("--tier", default="default", choices=("default", "fast", "flex"))
+        s.add_argument("--network", action="store_true")
+        s.add_argument("--add-dir", action="append", default=[])
+        s.add_argument("--codex-home", default="")
+        s.add_argument("--wait-slot", type=float, default=0.0)
+        s.add_argument("--force", action="store_true", help="skip quota/budget/CAPPED preflight")
+    w = sub.add_parser("wait")
+    w.add_argument("lane_id")
+    w.add_argument("--max", type=float, default=540)
+    sub.add_parser("result").add_argument("lane_id")
+    sub.add_parser("status").add_argument("--all", action="store_true")
+    sub.add_parser("quota").add_argument("--codex-home", default="")
+    sub.add_parser("cancel").add_argument("lane_id")
+    sub.add_parser("watch", help="follow a lane (or all live lanes) as readable lines").add_argument("lane_id", nargs="?")
+    return ap
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] == ["_supervise"]:
+        return supervise(argv[1])
+    if CONFIG_ERRORS:
+        return emit({"status": "usage_error", "error": "; ".join(CONFIG_ERRORS)}, 2)
+    try:
+        a = build_parser().parse_args(argv)
+    except UsageError as exc:
+        return emit({"status": "usage_error", "error": str(exc)}, 2)
+    try:
+        return dispatch(a)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return emit({"status": "error", "error": f"{type(exc).__name__}: {exc}"[:500]}, 1)
+
+
+def cmd_result(a: argparse.Namespace) -> int:
+    res = read_json(RUNS / a.lane_id / "result.json")
+    if not res:
+        return emit({"lane_id": a.lane_id, "status": "no_result"}, 1)
+    code = 0 if res.get("status") == "ok" else 1
+    if not human():
+        return emit(res, code)
+    print(f'{res.get("status", "?").upper()}  {res.get("label")}  {res.get("model")} {res.get("effort")}  '
+          f'[{res.get("profile") or "no profile"}]  account={account_label(res)}  took {res.get("duration_s")}s')
+    if res.get("worktree"):
+        print(f'branch {res.get("branch")}  worktree {res.get("worktree")}')
+    print(f'report: {res.get("report_path")}\n')
+    print(res.get("summary") or "")
+    return code
+
+
+def dispatch(a: argparse.Namespace) -> int:
+    if a.cmd in ("start", "run", "route"):
+        return cmd_start(a, wait_after=a.cmd == "run", route_only=a.cmd == "route")
+    if a.cmd == "wait":
+        return wait_for(a.lane_id, a.max)
+    return {"result": cmd_result, "status": cmd_status, "quota": cmd_quota, "cancel": cmd_cancel, "watch": cmd_watch}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
