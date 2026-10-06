@@ -76,6 +76,8 @@ A write lane reserves its whole repository checkout (or its own worktree), plus 
 
 Codex workers run without your user config, hooks, MCP servers or nested agents; Claude workers get the repo's project settings and no MCP servers. Every lane runs with an explicit model and effort, and the result also records the model the worker reported (and, for Codex, the effort). Secret-looking environment variables are stripped. A wall-clock limit kills the worker's whole process group, and if any of it survives, the lane ends in `error` and keeps its paths reserved. A worktree lane's brief also names its working copy, so a model that follows the brief's `Repo:` path doesn't edit the original checkout. The report must open with `STATUS: DONE|BLOCKED` or `VERDICT: LGTM|REVISE`. Lane checks this report format; the caller still needs to assess the result.
 
+Lane imposes no word or length limit on worker reports. Workers follow the level of detail requested in the brief, and the JSON result's `summary` contains the full report without truncation.
+
 ## Profiles
 
 `profiles.json` maps an intent to provider, model, effort, sandbox, kind, worktree and time limit:

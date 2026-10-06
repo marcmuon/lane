@@ -82,7 +82,6 @@ WEEK_MINUTES = 10080
 STARTUP_GRACE_S = 60
 KILL_GRACE_S = 10
 CAPPED_HOLD_S = 6 * 3600   # after a worker hits a usage limit, refuse new lanes on that account this long
-SUMMARY_CHARS = 1500
 PROFILES_PATH = Path(os.environ.get("LANE_PROFILES", Path(__file__).resolve().parent / "profiles.json"))
 
 DEV_INSTRUCTIONS = """You are a bounded worker launched by the `lane` tool. Do only the task in the brief.
@@ -92,11 +91,13 @@ Your final message is your report and is read by a machine: follow the output co
 
 CONTRACTS = {
     "task": "\n\n---\nOUTPUT CONTRACT (required): the first line of your final message is exactly `STATUS: DONE` or "
-            "`STATUS: BLOCKED`. Then at most 150 words: what changed (files), the acceptance command you ran and its "
-            "result, and anything left open.",
+            "`STATUS: BLOCKED`. Then report what changed (files), the acceptance command you ran and its "
+            "result, and anything left open. Follow the brief's requested level of detail; "
+            "Lane imposes no word or length limit.",
     "review": "\n\n---\nOUTPUT CONTRACT (required): the first line of your final message is exactly `VERDICT: LGTM` or "
               "`VERDICT: REVISE`. Then numbered findings (most severe first), each with file:line, what is wrong, "
-              "and the fix. No praise, no summary of the change.",
+              "and the fix. No praise, no summary of the change. Follow the brief's requested level of detail; "
+              "Lane imposes no word or length limit.",
 }
 MARKER = {"task": re.compile(r"STATUS: (DONE|BLOCKED)"), "review": re.compile(r"VERDICT: (LGTM|REVISE)")}  # fullmatch on line 1
 PROVIDERS = ("openai", "deepseek", "spark", "claude")
@@ -1028,7 +1029,7 @@ def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: boo
         "tokens": ev.get("usage") or None, "report_path": str(final_path) if final_text else None,
         "marker": head if MARKER[p["kind"]].fullmatch(head) else None, "report_words": len((final_text or "").split()),
         "summary": "\n".join(x for x in (setup_error, final_text or ev.get("fatal") or
-                                         (stderr_tail.strip() if state != "ok" else "")) if x)[:SUMMARY_CHARS],
+                                         (stderr_tail.strip() if state != "ok" else "")) if x),
         "quota_before": before.get("used_percent"), "quota_after": (after or {}).get("used_percent"),
         "quota_delta_raw": raw_delta, "quota_delta": delta, "overlapping_lanes": overlap,
         "run_dir": str(run), "finished_at": ended,

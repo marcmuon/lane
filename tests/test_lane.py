@@ -70,6 +70,25 @@ class LaneTest(unittest.TestCase):
         rc, r = self.run_lane("--kind", "review", FAKE_CODEX_MODE="ok_review")
         self.assertEqual((rc, r["status"], r["marker"]), (0, "ok", "VERDICT: REVISE"))
 
+    def test_long_reports_reach_the_caller_without_a_lane_length_cap(self):
+        self.brief.write_text("Goal: investigate the issue thoroughly and report all findings and evidence.\n")
+        report = self.tmp / "worker-report.md"
+        for provider, model in (("openai", "gpt-6-astra"), ("claude", "opus")):
+            for kind, marker in (("task", "STATUS: DONE"), ("review", "VERDICT: REVISE")):
+                with self.subTest(provider=provider, kind=kind):
+                    text = marker + "\n" + "Detailed findings and acceptance evidence.\n" * 250 + "COMPLETE REPORT END"
+                    report.write_text(text)
+                    rc, r = self.run_lane("--provider", provider, "--model", model, "--kind", kind,
+                                          FAKE_REPORT_FILE=report)
+                    self.assertEqual((rc, r["status"], r["marker"]), (0, "ok", marker))
+                    self.assertEqual(Path(r["report_path"]).read_text(), text)
+                    self.assertEqual(r["summary"], text)
+                    self.assertEqual(r["report_words"], len(text.split()))
+                    brief = (Path(r["run_dir"]) / "brief.md").read_text()
+                    self.assertNotIn("at most 150 words", brief)
+                    rc, saved = self.lane("result", r["lane_id"])
+                    self.assertEqual((rc, saved["summary"]), (0, text))
+
     def test_capped_then_preflight_refuses(self):
         rc, r = self.run_lane(FAKE_CODEX_MODE="capped")
         self.assertEqual((rc, r["status"]), (1, "capped"))

@@ -73,6 +73,8 @@ texts = {"ok_task": "STATUS: DONE\nChanged a.py; ran pytest -q: 3 passed." + (f"
          "ok_review": "VERDICT: REVISE\n1. lane:10 off-by-one. Fix: use <=.",
          "nomarker": "I did the thing.", "late_marker": "Here is my report.\nSTATUS: DONE", "noreport": "", "o_missing": "STATUS: DONE\nfrom the event stream"}
 text = texts[mode]
+if os.environ.get("FAKE_REPORT_FILE"):
+    text = Path(os.environ["FAKE_REPORT_FILE"]).read_text()
 if text:
     ev({"type": "item.completed", "item": {"id": "item_9", "type": "agent_message", "text": text}})
 ev({"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 50}})

@@ -104,7 +104,7 @@ Common profiles are `investigate` for read-only exploration, `implement` for cod
 - **Claude write workers have no filesystem sandbox.** A worktree separates checkouts, but does not restrict shell access. Run Claude write workers only on repositories you trust. Codex workers use Codex's OS sandbox.
 - **Quota readings are account-wide and approximate.** Overlapping workers and your interactive sessions affect the measurements. Checks before launch cannot guarantee a job will finish before a usage limit.
 - **Worktrees share the repository's Git metadata.** Each worktree has separate files, but shares the Git directory needed for commits.
-- **Reports still need review.** Lane checks the required opening marker, not the correctness of the work or the requested report length.
+- **Reports still need review.** Lane checks the required opening marker, not the correctness of the work. Lane imposes no report length limit.
 
 ## Reference
 

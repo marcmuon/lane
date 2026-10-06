@@ -21,5 +21,8 @@ if mode == "capped":
     ev({"type": "result", "subtype": "error_during_execution", "is_error": True, "result": "You've hit your session limit", "session_id": sid})
     sys.exit(1)
 text = {"ok": "STATUS: DONE\nChanged a.py; tests pass.", "review": "VERDICT: LGTM\nNo findings.", "nomarker": "done."}[mode]
+if os.environ.get("FAKE_REPORT_FILE"):
+    with open(os.environ["FAKE_REPORT_FILE"]) as report:
+        text = report.read()
 ev({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
 ev({"type": "result", "subtype": "success", "is_error": False, "result": text, "session_id": sid, "usage": {"input_tokens": 900, "output_tokens": 40}})
