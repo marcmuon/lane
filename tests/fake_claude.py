@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """Stand-in for `claude -p --output-format stream-json` in lane's tests. FAKE_CLAUDE_MODE picks the ending."""
 import json, os, sys, uuid
+from pathlib import Path
 args = sys.argv[1:]
 mode = os.environ.get("FAKE_CLAUDE_MODE", "ok")
-sys.stdin.read()
+prompt = sys.stdin.read()
 sid = str(uuid.uuid4())
 model = args[args.index("--model") + 1]
 dump = os.environ.get("FAKE_CLAUDE_DUMP")
 if dump:
-    sysf = args[args.index("--append-system-prompt-file") + 1]
+    sysflag = "--system-prompt-file" if "--system-prompt-file" in args else "--append-system-prompt-file"
+    sysf = args[args.index(sysflag) + 1]
     json.dump({"argv": args, "env_advisor": os.environ.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL"),
-               "env_token": os.environ.get("CLAUDE_CODE_MESSAGING_TOKEN"), "system": open(sysf).read()}, open(dump, "w"))
+               "env_token": os.environ.get("CLAUDE_CODE_MESSAGING_TOKEN"), "system": open(sysf).read(),
+               "env_no_rules": os.environ.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS"),
+               "cwd": os.getcwd(), "cwd_files": os.listdir(), "prompt": prompt}, open(dump, "w"))
 def ev(o): print(json.dumps(o), flush=True)
 ev({"type": "system", "subtype": "init", "model": "claude-opus-5-5" if model == "opus" else model, "session_id": sid})
+if os.environ.get("FAKE_EVENTS_FILE"):
+    for line in Path(os.environ["FAKE_EVENTS_FILE"]).read_text().splitlines():
+        ev(json.loads(line))
 ev({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "rateLimitType": "seven_day", "utilization": float(os.environ.get("FAKE_CLAUDE_UTIL", "0.3")),
     "resetsAt": 4102444800, "unifiedWindows": {"seven_day": {"utilization": float(os.environ.get("FAKE_CLAUDE_UTIL", "0.3")), "resetsAt": 4102444800},
     "five_hour": {"utilization": 0.1}}}})

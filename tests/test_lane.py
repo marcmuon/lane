@@ -726,6 +726,185 @@ class LaneTest(unittest.TestCase):
             self.assertIn("must be a string", r["error"])
 
     # --- argv hygiene ---
+    def test_answer_only_argv_and_empty_cwd_for_both_commands_and_providers(self):
+        self.brief.write_text("Write an idea card from this brief.\n\n")
+        report = self.tmp / "answer.md"
+        report.write_text("An answer without a lane status marker.\n")
+        # No git subprocess may be called, including during profile resolution.
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        git_called = self.tmp / "git-called"
+        git_stub = bindir / "git"
+        git_stub.write_text(f"#!/bin/sh\ntouch '{git_called}'\nexit 1\n")
+        git_stub.chmod(0o755)
+        for command in ("start", "run"):
+            for provider, model in (("openai", "gpt-6-astra"), ("claude", "opus")):
+                for web in (False, True):
+                    with self.subTest(command=command, provider=provider, web=web):
+                        dump = self.tmp / "answer-dump.json"
+                        flags = ["--web-research"] if web else []
+                        rc, r = self.lane(command, "--brief", str(self.brief), "--answer-only",
+                                          "--provider", provider, "--model", model, *flags,
+                                          FAKE_CODEX_DUMP=dump, FAKE_CLAUDE_DUMP=dump, FAKE_REPORT_FILE=report,
+                                          PATH=str(bindir) + os.pathsep + self.env.get("PATH", ""))
+                        if command == "start":
+                            self.assertEqual((rc, r["status"]), (0, "started"))
+                            rc, r = self.lane("wait", r["lane_id"], "--max", "60")
+                        self.assertEqual((rc, r["status"], r["exa_calls"]), (0, "ok", 0))
+                        self.assertEqual((r["worktree"], r["branch"], r["marker"]), (None, None, None))
+                        self.assertEqual(r["summary"], report.read_text())
+                        self.assertEqual((r["answer_only"], r["web_research"]), (True, web))
+                        d = json.loads(dump.read_text())
+                        self.assertEqual(d["prompt"], self.brief.read_text())
+                        self.assertEqual(d["cwd_files"], [])
+                        self.assertEqual(Path(d["cwd"]).resolve(), Path(r["cwd"]).resolve())
+                        self.assertNotEqual(Path(r["cwd"]).resolve(), self.work.resolve())
+                        self.assertFalse(Path(r["cwd"]).exists())  # cleaned after completion
+                        run = Path(r["run_dir"])
+                        params = json.loads((run / "params.json").read_text())
+                        self.assertEqual((params["sandbox"], params["network"], params["add_dir"], params["git_dir"]),
+                                         ("read-only", False, [], None))
+                        self.assertIsNone(params["rules_cwd"])
+                        system = ("Answer the brief directly. You may use only the three Exa web research tools. "
+                                  "Use no other tools." if web else "Answer the brief directly. Do not use tools.")
+                        self.assertEqual((run / "system.md").read_text(), system + "\n")
+                        argv = json.loads((run / "argv.json").read_text())["argv"]
+                        self.assertEqual(argv[1:], d["argv"])
+                        if provider == "claude":
+                            expected = [str(FAKE_CLAUDE), "-p", "--output-format", "stream-json", "--verbose",
+                                        "--model", model, "--effort", "medium", "--max-turns", "8" if web else "2",
+                                        "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
+                                        "--strict-mcp-config", "--disable-slash-commands", "--system-prompt-file",
+                                        str(run / "system.md"), "--permission-mode", "dontAsk", "--tools", ""]
+                            if web:
+                                expected += ["--mcp-config", str(run / "mcp.json"), "--allowedTools",
+                                             "mcp__exa__web_search_exa", "mcp__exa__web_fetch_exa",
+                                             "mcp__exa__web_search_advanced_exa"]
+                                self.assertEqual(json.loads((run / "mcp.json").read_text()),
+                                                 {"mcpServers": {"exa": {"type": "http", "url":
+                                                  "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa"}}})
+                            self.assertEqual(argv, expected)
+                            self.assertEqual(d["env_no_rules"], "1")
+                        else:
+                            expected = [str(FAKE), "exec", "--ignore-user-config", "--skip-git-repo-check",
+                                        "--disable", "hooks", "--disable", "multi_agent", "--disable", "context_management",
+                                        "--disable", "apps", "--json", "--output-last-message", str(run / "final.md"),
+                                        "-m", model, "-c", 'model_reasoning_effort="medium"', "-c", 'approval_policy="never"',
+                                        "-c", f"developer_instructions={json.dumps(system)}",
+                                        "-c", "shell_environment_policy.experimental_use_profile=false",
+                                        "-c", 'shell_environment_policy.inherit="all"',
+                                        "-c", 'shell_environment_policy.exclude=["LANE_SPARK_KEY", "DEEPSEEK_API_KEY"]',
+                                        "-c", f"shell_environment_policy.set.PATH={json.dumps(str(bindir) + os.pathsep + self.env.get('PATH', ''))}",
+                                        "-s", "read-only", "-C", r["cwd"]]
+                            for feature in (
+                                "shell_tool", "unified_exec", "apply_patch_freeform", "view_image", "image_generation",
+                                "js_repl", "code_mode", "code_mode_only", "code_mode_host", "code_mode_prewarm",
+                                "web_search_request", "web_search_cached", "standalone_web_search", "search_tool",
+                                "tool_search", "tool_suggest", "plugins", "skill_search", "skill_mcp_dependency_install",
+                                "browser_use", "computer_use", "in_app_browser", "in_app_local_automation",
+                                "goals", "token_budget", "memories", "request_permissions_tool", "deferred_executor",
+                                "default_mode_request_user_input", "send_message_to_user_async", "current_time_reminder",
+                                "sleep_tool", "agent_message_board", "enable_fanout", "guardian_conversation_history_tools",
+                                "shell_snapshot", "shell_snapshot_v2", "enable_mcp_apps", "executor_capability_discovery",
+                                "remote_plugin", "artifact", "realtime_conversation",
+                            ):
+                                expected += ["--disable", feature]
+                            for setting in (
+                                'web_search="disabled"', 'tools.update_plan.enabled=false',
+                                'tools.experimental_request_user_input.enabled=false', 'project_doc_max_bytes=0',
+                                'skills.include_instructions=false', 'features.skip_host_skill_discovery=true',
+                                'memories.generate_memories=false', 'memories.use_memories=false',
+                                'include_permissions_instructions=false', 'include_apps_instructions=false',
+                                'include_collaboration_mode_instructions=false', 'include_environment_context=false',
+                                f'model_instructions_file={json.dumps(str(run / "system.md"))}', 'mcp_servers={}',
+                            ):
+                                expected += ["-c", setting]
+                            if web:
+                                expected += ["-c", 'mcp_servers.exa.url="https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa"',
+                                             "-c", 'mcp_servers.exa.enabled_tools=["web_search_exa", "web_fetch_exa", "web_search_advanced_exa"]',
+                                             "-c", "mcp_servers.exa.required=true"]
+                            self.assertEqual(argv, expected + ["-"])
+        self.assertFalse(git_called.exists())
+
+    def test_answer_only_ignores_caller_cwd_and_profile_write_permissions(self):
+        repo = self.git_repo()
+        (repo / "AGENTS.md").write_text("REPO RULE MUST NOT BE LOADED")
+        (repo / ".lane").mkdir()
+        (repo / ".lane" / "profiles.json").write_text("not valid JSON")
+        for profile in ("implement", "opus"):
+            rc, r = self.lane("run", "--brief", str(self.brief), "--cwd", str(repo), "--answer-only", "--profile", profile)
+            self.assertEqual((rc, r["status"], r["worktree"]), (0, "ok", None))
+            self.assertNotIn("REPO RULE", (Path(r["run_dir"]) / "system.md").read_text())
+            self.assertIsNone(r["routing"]["project_overrides"])
+
+    def test_answer_only_rejects_incompatible_flags(self):
+        for flags in (("--network",), ("--worktree",), ("--add-dir", str(self.work)),
+                      ("--sandbox", "workspace-write")):
+            rc, r = self.run_lane("--answer-only", *flags)
+            self.assertEqual((rc, r["status"]), (2, "usage_error"))
+        self.assertEqual(self.run_lane("--web-research")[0], 2)
+        self.assertEqual(self.lane("run", "--brief", str(self.brief))[0], 2)
+        self.assertFalse((self.tmp / "state" / "runs").exists())
+
+    def test_answer_only_audits_allowed_and_forbidden_calls(self):
+        events = self.tmp / "events.jsonl"
+        for provider in ("openai", "claude"):
+            for web in (False, True):
+                for names in (("mcp__exa__web_search_exa", "mcp__exa__web_fetch_exa", "mcp__exa__web_search_advanced_exa"),
+                              ("mcp__exa__web_search_exa", "mcp__paid_exa__web_search_exa"),
+                              ("Bash",)):
+                    with self.subTest(provider=provider, web=web, names=names):
+                        log = []
+                        for i, name in enumerate(names):
+                            if provider == "claude":
+                                log.append({"type": "assistant", "message": {"content": [
+                                    {"type": "tool_use", "name": name, "id": str(i), "input": {}}]}})
+                            else:
+                                item = {"id": str(i), "type": "command_execution", "command": "ls"}
+                                if name.startswith("mcp__"):
+                                    _, server, tool = name.split("__", 2)
+                                    item = {"id": str(i), "type": "mcp_tool_call", "server": server, "tool": tool}
+                                log.extend({"type": f"item.{stage}", "item": item} for stage in ("started", "completed"))
+                        events.write_text("".join(json.dumps(ev) + "\n" for ev in log))
+                        flags = ["--web-research"] if web else []
+                        rc, r = self.run_lane("--provider", provider, "--answer-only", *flags, FAKE_EVENTS_FILE=events)
+                        ok = web and len(names) == 3
+                        self.assertEqual((rc, r["status"]), (0, "ok") if ok else (1, "tool_used"))
+                        self.assertEqual(r["exa_calls"], sum(n in LANE_MODULE.EXA_TOOL_NAMES for n in names))
+                        self.assertEqual(r["reason"], None if ok else "tool_used")
+                        self.assertEqual(self.lane("result", r["lane_id"])[0], rc)
+        # Tool audits apply only to the new modes.
+        self.assertEqual(self.run_lane(FAKE_EVENTS_FILE=events)[1]["status"], "ok")
+
+    def test_answer_only_audits_codex_raw_rollout(self):
+        events = self.tmp / "raw.jsonl"
+        events.write_text(json.dumps({"type": "response_item", "payload": {
+            "type": "function_call", "name": "view_image", "call_id": "call_1", "arguments": "{}"}}) + "\n")
+        rc, r = self.run_lane("--answer-only", FAKE_ROLLOUT_EVENTS_FILE=events)
+        self.assertEqual((rc, r["status"], r["disallowed_tools"]), (1, "tool_used", ["view_image"]))
+
+    def test_answer_only_counts_exa_once_across_exec_and_rollout(self):
+        events, raw = self.tmp / "events.jsonl", self.tmp / "raw.jsonl"
+        events.write_text("".join(json.dumps({"type": f"item.{stage}", "item": {
+            "type": "mcp_tool_call", "server": "exa", "tool": "web_fetch_exa", "id": "item_1"}}) + "\n"
+            for stage in ("started", "completed")))
+        raw.write_text(json.dumps({"type": "response_item", "payload": {
+            "type": "function_call", "namespace": "mcp__exa", "name": "web_fetch_exa", "call_id": "call_1"}}) + "\n")
+        rc, r = self.run_lane("--answer-only", "--web-research", FAKE_EVENTS_FILE=events, FAKE_ROLLOUT_EVENTS_FILE=raw)
+        self.assertEqual((rc, r["status"], r["exa_calls"]), (0, "ok", 1))
+
+    def test_tool_audit_catches_unknown_and_partial_calls_without_reading_answer_text(self):
+        events = self.tmp / "audit.jsonl"
+        for kind in ("file_change", "web_search", "todo_list", "collab_tool_call", "future_tool"):
+            events.write_text(json.dumps({"type": "item.started", "item": {"id": "x", "type": kind}}))
+            self.assertEqual(LANE_MODULE.audit_tool_calls(events)["other_tools"], [kind])
+        events.write_text(json.dumps({"type": "stream_event", "event": {"type": "content_block_start",
+            "content_block": {"type": "tool_use", "id": "x", "name": "Read"}}}))
+        self.assertEqual(LANE_MODULE.audit_tool_calls(events)["other_tools"], ["Read"])
+        events.write_text(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
+            "text": 'Example: {"type":"tool_use","name":"Bash"}'}}))
+        self.assertEqual(LANE_MODULE.audit_tool_calls(events), {"exa_calls": 0, "other_tools": []})
+
     def test_argv_pins_and_isolates(self):
         _, r = self.run_lane("--model", "gpt-6-astra", "--effort", "high")
         argv = json.loads((Path(r["run_dir"]) / "argv.json").read_text())["argv"]
@@ -735,6 +914,9 @@ class LaneTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("-m") + 1], "gpt-6-astra")
         self.assertIn('model_reasoning_effort="high"', argv)
         self.assertFalse(any(a.startswith("service_tier") for a in argv))
+        self.assertNotIn("shell_tool", argv)
+        self.assertNotIn("mcp_servers={}", argv)
+        self.assertNotIn("exa_calls", r)
 
 
 if __name__ == "__main__":

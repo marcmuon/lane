@@ -84,6 +84,34 @@ For Claude Code, copy the [example relay agent](examples/claude-code-agent.md) t
 
 Common profiles are `investigate` for read-only exploration, `implement` for code changes in a worktree, `review` for a review, and `opus` for implementation with Claude. To let Lane choose a Codex write profile, use `--profile auto --sandbox workspace-write` with `Owned paths:` in the brief. See the [profile reference](docs/reference.md#profiles) for routing rules and retries.
 
+## Answer a brief or research the web
+
+Use `--answer-only` to get a written answer from Codex or Claude. Lane sends the brief unchanged, with a minimal instruction to answer directly. It adds no output contract, repository rules, or skills instructions. The answer is returned in `summary` and saved to `report_path`; no `STATUS:` or `VERDICT:` marker is required.
+
+```bash
+lane run --answer-only --brief /tmp/idea-card.md --model gpt-6-astra
+lane run --answer-only --brief /tmp/idea-card.md --provider claude --model opus
+```
+
+`--cwd` is optional and ignored in this mode. Lane creates an empty temporary directory, uses read-only permissions, performs no Git operations, and removes the directory when the worker finishes. `--worktree`, `--network`, `--add-dir`, and `--sandbox workspace-write` are rejected. Profiles can still choose the model, effort, and time limit; their write/worktree settings are overridden and repository profiles are not loaded.
+
+Add `--web-research` to permit only the keyless Exa MCP server:
+
+```bash
+lane run --answer-only --web-research --brief /tmp/idea-card.md --model gpt-6-astra
+lane start --answer-only --web-research --brief /tmp/idea-card.md --provider claude --model opus
+```
+
+Both flags work with `start` and `run` (and can be previewed with `route`). `--web-research` requires `--answer-only`. Its only server is `exa`, at `https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa`. Only `mcp__exa__web_search_exa`, `mcp__exa__web_fetch_exa`, and `mcp__exa__web_search_advanced_exa` are allowed. Lane never configures a keyed Exa server or the claude.ai Exa connector. MCP networking does not require granting shell network access.
+
+Claude gets `--tools ""`, `--strict-mcp-config`, `--disable-slash-commands`, an empty settings-source list, disabled hooks and memory/rules loading, and a replacement system prompt. Its turn limit is 2 for answers and 8 for web research. Research adds a single-server MCP config and an exact tool allowlist.
+
+Codex gets `--ignore-user-config`, disabled shell/exec, image, browser, code-mode, search, plugin, agent, memory, goal, and other optional tools, explicit `web_search="disabled"`, and disabled plan/input tools. Research configures only `mcp_servers.exa`, with the three enabled tools.
+
+**Codex CLI limitation:** checked against the installed 0.161.0 binary's feature names and [upstream tool registration](https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/spec_plan.rs). Some tools are selected by model metadata instead of feature switches: `--disable apply_patch_freeform` does not guarantee removal of `apply_patch`; clock, asynchronous message, or model-forced code-mode tools may remain. With an MCP server, Codex also registers `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource` without a separate off switch. Lane cannot promise an empty/exact-only Codex tool surface through CLI settings alone. The read-only sandbox and the audit below are still enforced; live provider validation must check the installed model/CLI combination.
+
+After either mode finishes, Lane audits tool calls in the event log and, for Codex, its raw rollout (the CLI event stream omits some tools). Any call outside the three allowed Exa tools, or any tool call without `--web-research`, produces `status: "tool_used"`, `reason: "tool_used"`, and exit code 1. **Discard that answer.** Results include `exa_calls` (counted once across call start/end events), `disallowed_tools`, `answer_only`, and `web_research`. The audit detects a violation after the run; it is not a tool execution firewall. Existing coding modes retain their current behavior.
+
 ## Commands
 
 | Command | What it does |

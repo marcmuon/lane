@@ -13,7 +13,10 @@ mode = os.environ.get("FAKE_CODEX_MODE", "ok_task")
 final = Path(args[args.index("--output-last-message") + 1])
 model = args[args.index("-m") + 1]
 effort = next((a.split("=", 1)[1].strip('"') for a in args if a.startswith("model_reasoning_effort=")), None)
-sys.stdin.read()
+prompt = sys.stdin.read()
+if os.environ.get("FAKE_CODEX_DUMP"):
+    Path(os.environ["FAKE_CODEX_DUMP"]).write_text(json.dumps({
+        "argv": args, "cwd": os.getcwd(), "cwd_files": os.listdir(), "prompt": prompt}))
 thread = str(uuid.uuid4())
 home = Path(os.environ["CODEX_HOME"])
 used = float(os.environ.get("FAKE_USED", "40"))
@@ -34,12 +37,17 @@ def rollout(used_after):
         fh.write(json.dumps({"timestamp": ts, "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
             "limit_id": "codex", "primary": {"used_percent": used_after, "window_minutes": 10080, "resets_at": resets},
             "plan_type": "pro"}}}) + "\n")
+        if os.environ.get("FAKE_ROLLOUT_EVENTS_FILE"):
+            fh.write(Path(os.environ["FAKE_ROLLOUT_EVENTS_FILE"]).read_text())
 
 
 if os.environ.get("FAKE_CODEX_ENV_DUMP"):
     Path(os.environ["FAKE_CODEX_ENV_DUMP"]).write_text(json.dumps({"LANE_SPARK_KEY": os.environ.get("LANE_SPARK_KEY")}))
 ev({"type": "thread.started", "thread_id": thread})
 ev({"type": "turn.started"})
+if os.environ.get("FAKE_EVENTS_FILE"):
+    for line in Path(os.environ["FAKE_EVENTS_FILE"]).read_text().splitlines():
+        ev(json.loads(line))
 _leak = os.environ.get(os.environ.get("FAKE_CODEX_LEAK_ENV", ""), "")
 if _leak:
     ev({"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": f"thinking about {_leak}"}})
