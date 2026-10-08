@@ -767,6 +767,8 @@ class LaneTest(unittest.TestCase):
                         self.assertIsNone(params["rules_cwd"])
                         system = ("Answer the brief directly. You may use only the three Exa web research tools. "
                                   "Use no other tools." if web else "Answer the brief directly. Do not use tools.")
+                        if web and provider == "openai":
+                            system += " Use exec to call them through tools.mcp__exa__<tool>; use only direct, named tool access."
                         self.assertEqual((run / "system.md").read_text(), system + "\n")
                         argv = json.loads((run / "argv.json").read_text())["argv"]
                         self.assertEqual(argv[1:], d["argv"])
@@ -808,6 +810,8 @@ class LaneTest(unittest.TestCase):
                                 "shell_snapshot", "shell_snapshot_v2", "enable_mcp_apps", "executor_capability_discovery",
                                 "remote_plugin", "artifact", "realtime_conversation",
                             ):
+                                if web and feature in ("code_mode", "code_mode_only", "code_mode_host", "code_mode_prewarm"):
+                                    continue
                                 expected += ["--disable", feature]
                             for setting in (
                                 'web_search="disabled"', 'tools.update_plan.enabled=false',
@@ -892,6 +896,98 @@ class LaneTest(unittest.TestCase):
             "type": "function_call", "namespace": "mcp__exa", "name": "web_fetch_exa", "call_id": "call_1"}}) + "\n")
         rc, r = self.run_lane("--answer-only", "--web-research", FAKE_EVENTS_FILE=events, FAKE_ROLLOUT_EVENTS_FILE=raw)
         self.assertEqual((rc, r["status"], r["exa_calls"]), (0, "ok", 1))
+
+    def test_web_research_allows_codex_exec_with_exa_calls(self):
+        events, raw = self.tmp / "events.jsonl", self.tmp / "raw.jsonl"
+        source = 'text(ALL_TOOLS.filter(t => t.name.startsWith("mcp__exa__")));\n'
+        for tool in ("web_search_exa", "web_fetch_exa", "web_search_advanced_exa"):
+            source += f'text(await tools.mcp__exa__{tool}({{"query": "test"}}));\n'
+        for stream in ("events", "rollout", "both"):
+            with self.subTest(stream=stream):
+                log, rollout = [], []
+                for i, tool in enumerate(("web_search_exa", "web_fetch_exa", "web_search_advanced_exa")):
+                    item = {"id": f"item_{i}", "type": "mcp_tool_call", "server": "exa", "tool": tool}
+                    log.extend({"type": f"item.{stage}", "item": item} for stage in ("started", "updated", "completed"))
+                    rollout.append({"type": "response_item", "payload": {
+                        "type": "function_call", "namespace": "mcp__exa", "name": tool, "call_id": f"call_{i}"}})
+                    rollout.extend({"type": "event_msg", "payload": {
+                        "type": f"mcp_tool_call_{stage}", "call_id": f"call_{i}",
+                        "invocation": {"server": "exa", "tool": tool}}} for stage in ("begin", "end"))
+                events.write_text("".join(json.dumps(e) + "\n" for e in log) if stream != "rollout" else "")
+                raw.write_text("".join(json.dumps(e) + "\n" for e in rollout) if stream != "events" else "")
+                rc, r = self.run_lane("--answer-only", "--web-research", FAKE_CODEX_MODE="nomarker",
+                                      FAKE_CODEX_EXEC_INPUT=source, FAKE_EVENTS_FILE=events, FAKE_ROLLOUT_EVENTS_FILE=raw)
+                self.assertEqual((rc, r["status"], r["exa_calls"], r["disallowed_tools"]), (0, "ok", 3, []))
+                self.assertIsNone(r["reason"])
+
+    def test_web_research_rejects_forbidden_codex_exec_input_without_nested_events(self):
+        cases = (
+            ('await tools.apply_patch("patch")', "apply_patch"),
+            ("text(await tools.clock__curr_time({}))", "clock__curr_time"),
+            ("text(await tools.list_mcp_resources({}))", "list_mcp_resources"),
+            ("text(await tools.list_mcp_resource_templates({}))", "list_mcp_resource_templates"),
+            ("text(await tools.read_mcp_resource({}))", "read_mcp_resource"),
+            ("await tools.exec_command({})", "exec_command"),
+            ('await tools["mcp__exa__web_search_exa"]({})', "exec:indirect_tools"),
+            ('await tools \n [ALL_TOOLS[0].name]({})', "exec:indirect_tools"),
+            ('await tools /* lookup */ ["apply_patch"]("patch")', "exec:indirect_tools"),
+            ('const alias = tools; await alias.apply_patch("patch")', "exec:indirect_tools"),
+            ('const {apply_patch} = tools; await apply_patch("patch")', "exec:indirect_tools"),
+            ('eval("tool" + "s.apply_patch(1)")', "exec:unclassified_input"),
+            (r't\u006fols.apply_patch("patch")', "exec:unclassified_input"),
+            ("", "exec:unclassified_input"),
+        )
+        for source, forbidden in cases:
+            with self.subTest(source=source):
+                rc, r = self.run_lane("--answer-only", "--web-research", FAKE_CODEX_EXEC_INPUT=source)
+                self.assertEqual((rc, r["status"], r["reason"], r["exa_calls"]), (1, "tool_used", "tool_used", 0))
+                self.assertIn(forbidden, r["disallowed_tools"])
+
+    def test_web_research_rejects_forbidden_nested_codex_exec_activity(self):
+        raw = self.tmp / "raw.jsonl"
+        cases = (
+            ("response_item", {"type": "custom_tool_call", "name": "apply_patch", "input": "patch"}, "apply_patch"),
+            ("response_item", {"type": "function_call", "name": "clock__curr_time"}, "clock__curr_time"),
+            ("response_item", {"type": "function_call", "name": "list_mcp_resources"}, "list_mcp_resources"),
+            ("response_item", {"type": "local_shell_call"}, "local_shell_call"),
+            ("response_item", {"type": "future_tool"}, "future_tool"),
+            ("response_item", {"type": "future_tool", "name": "mcp__exa__web_fetch_exa"},
+             "future_tool:mcp__exa__web_fetch_exa"),
+            ("event_msg", {"type": "exec_command_begin", "command": ["ls"]}, "exec_command_begin"),
+            ("event_msg", {"type": "patch_apply_begin"}, "patch_apply_begin"),
+            ("event_msg", {"type": "future_tool"}, "future_tool"),
+            ("event_msg", {"type": "mcp_tool_call_begin", "invocation": {"server": "other", "tool": "web_search_exa"}},
+             "mcp__other__web_search_exa"),
+            ("event_msg", {"type": "mcp_tool_call_end", "invocation": {"server": "exa", "tool": "unknown"}},
+             "mcp__exa__unknown"),
+            ("item.completed", {"type": "file_change"}, "file_change"),
+            ("item.started", {"type": "future_tool"}, "future_tool"),
+        )
+        for envelope, item, forbidden in cases:
+            with self.subTest(envelope=envelope, item=item):
+                raw.write_text(json.dumps({"type": "response_item", "payload": {
+                    "type": "mcp_tool_call", "server": "exa", "tool": "web_fetch_exa", "call_id": "exa_1"}}) + "\n" +
+                    json.dumps({"type": envelope, "item" if envelope.startswith("item.") else "payload": item}) + "\n")
+                rc, r = self.run_lane("--answer-only", "--web-research", FAKE_CODEX_EXEC_INPUT="text(ALL_TOOLS);",
+                                      FAKE_ROLLOUT_EVENTS_FILE=raw)
+                self.assertEqual((rc, r["status"], r["reason"], r["exa_calls"]), (1, "tool_used", "tool_used", 1))
+                self.assertIn(forbidden, r["disallowed_tools"])
+
+    def test_web_research_rejects_codex_exec_without_classifiable_input(self):
+        raw = self.tmp / "raw.jsonl"
+        raw.write_text(json.dumps({"type": "response_item", "payload": {
+            "type": "custom_tool_call", "name": "exec", "call_id": "exec_1", "input": {"code": "text(ALL_TOOLS)"}}}) + "\n")
+        rc, r = self.run_lane("--answer-only", "--web-research", FAKE_ROLLOUT_EVENTS_FILE=raw)
+        self.assertEqual((rc, r["status"], r["disallowed_tools"]), (1, "tool_used", ["exec:unclassified_input"]))
+
+    def test_plain_answer_only_rejects_codex_exec(self):
+        rc, r = self.run_lane("--answer-only", FAKE_CODEX_EXEC_INPUT="text(ALL_TOOLS);")
+        self.assertEqual((rc, r["status"], r["exa_calls"], r["disallowed_tools"]), (1, "tool_used", 0, ["exec"]))
+
+    def test_coding_mode_does_not_audit_codex_exec(self):
+        rc, r = self.run_lane(FAKE_CODEX_EXEC_INPUT='await tools.apply_patch("patch")')
+        self.assertEqual((rc, r["status"]), (0, "ok"))
+        self.assertNotIn("exa_calls", r)
 
     def test_tool_audit_catches_unknown_and_partial_calls_without_reading_answer_text(self):
         events = self.tmp / "audit.jsonl"

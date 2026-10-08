@@ -37,8 +37,15 @@ def rollout(used_after):
         fh.write(json.dumps({"timestamp": ts, "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
             "limit_id": "codex", "primary": {"used_percent": used_after, "window_minutes": 10080, "resets_at": resets},
             "plan_type": "pro"}}}) + "\n")
+        if "FAKE_CODEX_EXEC_INPUT" in os.environ:
+            fh.write(json.dumps({"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec", "call_id": "exec_1",
+                "input": os.environ["FAKE_CODEX_EXEC_INPUT"]}}) + "\n")
         if os.environ.get("FAKE_ROLLOUT_EVENTS_FILE"):
             fh.write(Path(os.environ["FAKE_ROLLOUT_EVENTS_FILE"]).read_text())
+        if "FAKE_CODEX_EXEC_INPUT" in os.environ:
+            fh.write(json.dumps({"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": "exec_1", "output": "Script completed"}}) + "\n")
 
 
 if os.environ.get("FAKE_CODEX_ENV_DUMP"):
