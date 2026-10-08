@@ -38,6 +38,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -88,6 +89,30 @@ DEV_INSTRUCTIONS = """You are a bounded worker launched by the `lane` tool. Do o
 Stay inside the working directory and any owned paths the brief lists. Do not spawn agents, start workflows,
 launch nested Codex, or write planning files of your own. Do not use broker, trading or payment tools.
 Your final message is your report and is read by a machine: follow the output contract at the end of the brief."""
+
+EXA_URL = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa"
+EXA_TOOLS = ("web_search_exa", "web_fetch_exa", "web_search_advanced_exa")
+EXA_TOOL_NAMES = tuple(f"mcp__exa__{tool}" for tool in EXA_TOOLS)
+# Codex 0.161.0 feature names. Some model-defined tools have no CLI off switch;
+# see README and the post-run audit (including the raw rollout).
+ANSWER_DISABLED_FEATURES = (
+    "shell_tool", "unified_exec", "apply_patch_freeform", "view_image", "image_generation",
+    "js_repl", "code_mode", "code_mode_only", "code_mode_host", "code_mode_prewarm",
+    "web_search_request", "web_search_cached", "standalone_web_search", "search_tool",
+    "tool_search", "tool_suggest", "plugins", "skill_search", "skill_mcp_dependency_install",
+    "browser_use", "computer_use", "in_app_browser", "in_app_local_automation",
+    "goals", "token_budget", "memories", "request_permissions_tool", "deferred_executor",
+    "default_mode_request_user_input", "send_message_to_user_async", "current_time_reminder",
+    "sleep_tool", "agent_message_board", "enable_fanout", "guardian_conversation_history_tools",
+    "shell_snapshot", "shell_snapshot_v2", "enable_mcp_apps", "executor_capability_discovery",
+    "remote_plugin", "artifact", "realtime_conversation",
+)
+
+
+def answer_instructions(p: dict) -> str:
+    if p.get("web_research"):
+        return "Answer the brief directly. You may use only the three Exa web research tools. Use no other tools."
+    return "Answer the brief directly. Do not use tools."
 
 CONTRACTS = {
     "task": "\n\n---\nOUTPUT CONTRACT (required): the first line of your final message is exactly `STATUS: DONE` or "
@@ -675,6 +700,22 @@ def repo_rules(cwd: str) -> str:
 
 def build_claude_argv(p: dict, run: Path) -> tuple[list[str], dict]:
     sysfile = run / "system.md"
+    if p.get("answer_only"):
+        sysfile.write_text(answer_instructions(p) + "\n")
+        argv = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose",
+                "--model", p["model"], "--effort", p["effort"],
+                "--max-turns", "8" if p.get("web_research") else "2",
+                "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
+                "--strict-mcp-config", "--disable-slash-commands", "--system-prompt-file", str(sysfile),
+                "--permission-mode", "dontAsk", "--tools", ""]
+        if p.get("web_research"):
+            mcpfile = run / "mcp.json"
+            write_json(mcpfile, {"mcpServers": {"exa": {"type": "http", "url": EXA_URL}}})
+            argv += ["--mcp-config", str(mcpfile), "--allowedTools", *EXA_TOOL_NAMES]
+        env = worker_env()
+        env.update(CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1", CLAUDE_CODE_DISABLE_AUTO_MEMORY="1",
+                   CLAUDE_CODE_DISABLE_CLAUDE_MDS="1", CLAUDE_CODE_DISABLE_ORG_MEMORY="1")
+        return argv, env
     rules = repo_rules(p.get("rules_cwd") or p["cwd"])
     sysfile.write_text(DEV_INSTRUCTIONS + ("\n\nRepository rules (follow them):\n\n" + rules if rules else "") + "\n")
     write = p["sandbox"] == "workspace-write"
@@ -760,17 +801,39 @@ def record_claude_rate(rate: dict | None) -> None:
                                        "five_hour": (windows.get("five_hour") or {}).get("utilization"), "ts": time.time()})
 
 def build_argv(p: dict, final_path: Path) -> tuple[list[str], dict]:
+    instructions = answer_instructions(p) if p.get("answer_only") else DEV_INSTRUCTIONS
     argv = [CODEX_BIN, "exec", "--ignore-user-config", "--skip-git-repo-check",
             "--disable", "hooks", "--disable", "multi_agent", "--disable", "context_management", "--disable", "apps",
             "--json", "--output-last-message", str(final_path),
             "-m", p["model"], "-c", f"model_reasoning_effort={json.dumps(p['effort'])}",
             "-c", 'approval_policy="never"',
-            "-c", f"developer_instructions={json.dumps(DEV_INSTRUCTIONS)}",
+            "-c", f"developer_instructions={json.dumps(instructions)}",
             "-c", "shell_environment_policy.experimental_use_profile=false",
             "-c", 'shell_environment_policy.inherit="all"',
             "-c", 'shell_environment_policy.exclude=["LANE_SPARK_KEY", "DEEPSEEK_API_KEY"]',   # model-run commands
             "-c", f"shell_environment_policy.set.PATH={json.dumps(os.environ.get('PATH', ''))}",
             "-s", p["sandbox"], "-C", p["cwd"]]
+    if p.get("answer_only"):
+        sysfile = final_path.parent / "system.md"
+        sysfile.write_text(instructions + "\n")
+        for feature in ANSWER_DISABLED_FEATURES:
+            argv += ["--disable", feature]
+        for setting in (
+            'web_search="disabled"', "tools.update_plan.enabled=false",
+            "tools.experimental_request_user_input.enabled=false", "project_doc_max_bytes=0",
+            "skills.include_instructions=false", "features.skip_host_skill_discovery=true",
+            "memories.generate_memories=false", "memories.use_memories=false",
+            "include_permissions_instructions=false", "include_apps_instructions=false",
+            "include_collaboration_mode_instructions=false", "include_environment_context=false",
+            f"model_instructions_file={json.dumps(str(sysfile))}",
+        ):
+            argv += ["-c", setting]
+        # Replace the whole table as well as pinning the URL: no inherited/keyed server.
+        argv += ["-c", "mcp_servers={}"]
+        if p.get("web_research"):
+            argv += ["-c", f"mcp_servers.exa.url={json.dumps(EXA_URL)}",
+                     "-c", f"mcp_servers.exa.enabled_tools={json.dumps(EXA_TOOLS)}",
+                     "-c", "mcp_servers.exa.required=true"]
     env = worker_env()
     env["CODEX_HOME"] = p["codex_home"]
     if p["provider"] == "openai" and p["tier"] != "default":
@@ -857,8 +920,66 @@ def first_line(text: str) -> str:
     return ""
 
 
+def audit_tool_calls(path: Path) -> dict:
+    """Read Claude stream-json, Codex exec items, or raw Codex rollout calls.
+
+    Count call identities once across start/update/end events. Treat unknown
+    Codex item types as forbidden, so newly introduced tools fail closed.
+    """
+    calls = {}
+    try:
+        fh = path.open(errors="replace")
+    except OSError:
+        return {"exa_calls": 0, "other_tools": []}
+    with fh:
+        for lineno, line in enumerate(fh):
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            t = ev.get("type", "")
+            items = []
+            if t == "assistant":
+                items = [b for b in (ev.get("message") or {}).get("content", [])
+                         if b.get("type") in ("tool_use", "server_tool_use")]
+            elif t == "stream_event":
+                block = (ev.get("event") or {}).get("content_block") or {}
+                if block.get("type") in ("tool_use", "server_tool_use"):
+                    items = [block]
+            elif t in ("item.started", "item.updated", "item.completed"):
+                item = ev.get("item") or {}
+                if item.get("type") not in ("agent_message", "reasoning", "error"):
+                    items = [item]
+            elif t == "response_item":
+                item = ev.get("payload") or {}
+                if item.get("type", "").endswith("_call"):
+                    items = [item]
+            elif t in ("function_call", "custom_tool_call", "local_shell_call", "web_search_call"):
+                items = [ev]
+            for index, item in enumerate(items):
+                kind = item.get("type", "unknown")
+                name = item.get("name") or kind
+                if kind == "mcp_tool_call":
+                    name = f"mcp__{item.get('server')}__{item.get('tool')}"
+                elif item.get("namespace") == "mcp__exa" and name in EXA_TOOLS:
+                    name = f"mcp__exa__{name}"
+                elif item.get("namespace") == "functions" and name in EXA_TOOL_NAMES:
+                    pass
+                elif item.get("namespace"):
+                    name = f"{item['namespace']}.{name}"
+                call_id = item.get("call_id") or item.get("id") or f"line:{lineno}:{index}"
+                # A server-side tool with an Exa-looking name is not an MCP call.
+                if kind == "server_tool_use":
+                    name = f"server_tool_use:{name}"
+                calls[(call_id, name)] = name
+    return {"exa_calls": sum(name in EXA_TOOL_NAMES for name in calls.values()),
+            "other_tools": sorted({name for name in calls.values() if name not in EXA_TOOL_NAMES})}
+
+
 def classify(rc: int | None, timed_out: bool, cancelled: bool, ev: dict, final_text: str, stderr_tail: str,
-             kind: str) -> str:
+             kind: str, answer_only: bool = False) -> str:
     blob = f"{ev.get('fatal') or ''}\n{stderr_tail}".lower()
     if "hit your session limit" in blob or "hit your weekly limit" in blob:
         blob += " usage limit"
@@ -874,7 +995,7 @@ def classify(rc: int | None, timed_out: bool, cancelled: bool, ev: dict, final_t
         return "error"
     if not final_text.strip():
         return "no_report"
-    if not MARKER[kind].fullmatch(first_line(final_text)):
+    if not answer_only and not MARKER[kind].fullmatch(first_line(final_text)):
         return "contract_violation"
     return "ok"
 
@@ -1001,9 +1122,21 @@ def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: boo
         stderr_tail = (run / "stderr.log").read_text(errors="replace")[-4000:]
     except OSError:
         stderr_tail = ""
-    state = "error" if setup_error else classify(rc, timed_out, cancelled, ev, final_text, stderr_tail, p["kind"])
+    state = "error" if setup_error else classify(rc, timed_out, cancelled, ev, final_text, stderr_tail, p["kind"],
+                                                p.get("answer_only", False))
     facts = ({"model_verified": ev.get("model"), "effort_recorded": None, "rollout": None} if is_claude
              else rollout_facts(p["codex_home"], ev.get("thread_id")))
+    audit = None
+    if p.get("answer_only"):
+        audit = audit_tool_calls(run / "events.jsonl")
+        if facts.get("rollout"):
+            # exec --json omits some tool types (e.g. view_image). The raw rollout
+            # also records those calls. Its Exa calls duplicate the exec stream.
+            raw = audit_tool_calls(Path(facts["rollout"]))
+            audit["exa_calls"] = max(audit["exa_calls"], raw["exa_calls"])
+            audit["other_tools"] = sorted(set(audit["other_tools"] + raw["other_tools"]))
+        if audit["other_tools"] or (audit["exa_calls"] and not p.get("web_research")):
+            state = "tool_used"
     after = latest_rate_limit(p["codex_home"], since=started - 5) if p["provider"] == "openai" else None
     before = p.get("quota_before") or {}
     ended = time.time()
@@ -1035,6 +1168,14 @@ def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: boo
         "run_dir": str(run), "finished_at": ended,
         "profile": p.get("profile"), "routing": p.get("routing"),
     }
+    if audit is not None:
+        result.update(answer_only=True, web_research=p.get("web_research", False),
+                      exa_calls=audit["exa_calls"], disallowed_tools=audit["other_tools"],
+                      reason="tool_used" if state == "tool_used" else None)
+        if audit["exa_calls"] and not p.get("web_research"):
+            result["disallowed_tools"] = sorted(set(result["disallowed_tools"] + ["exa"]))
+    if p.get("answer_only") and not stuck:
+        shutil.rmtree(p["cwd"], ignore_errors=True)
     write_json(run / "result.json", result)
     # a stuck group stays "running" so is_live() keeps its reservation while any member is alive
     status.update(state="running" if stuck else "done", result_status=state, finished_at=ended)
@@ -1046,16 +1187,25 @@ def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: boo
 
 def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool = False) -> int:
     brief = Path(a.brief).expanduser().resolve()
-    cwd = Path(a.cwd).expanduser().resolve()
+    if a.web_research and not a.answer_only:
+        raise UsageError("--web-research requires --answer-only")
+    if a.answer_only and (a.worktree or a.network or a.add_dir or a.sandbox == "workspace-write"):
+        raise UsageError("--answer-only cannot use --worktree, --network, --add-dir or --sandbox workspace-write")
+    if not a.answer_only and not a.cwd:
+        raise UsageError("--cwd is required unless --answer-only is set")
+    cwd = None if a.answer_only else Path(a.cwd).expanduser().resolve()
     brief_text = brief.read_text(errors="replace") if brief.is_file() else ""
     if not brief_text.strip():
         return emit({"status": "usage_error", "error": f"brief missing or empty: {brief}"}, 2)
-    if not cwd.is_dir():
+    if cwd is not None and not cwd.is_dir():
         return emit({"status": "usage_error", "error": f"cwd not a directory: {cwd}"}, 2)
-    a.cwd = str(cwd)
+    a.cwd = str(cwd) if cwd is not None else None
     routing, refusal = resolve_route(a, brief_text)
     if refusal:
         return emit(refusal, 2)
+    if a.answer_only:
+        # Profiles may select a model/effort, but cannot grant write access.
+        a.sandbox, a.worktree = "read-only", False
     if route_only:
         return emit({"status": "routed", "profile": routing.get("profile"), "provider": a.provider, "model": a.model, "effort": a.effort,
                      "kind": a.kind, "sandbox": a.sandbox, "worktree": a.worktree, "max_time_s": a.max_time,
@@ -1074,7 +1224,7 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
             return emit(refusal, 4 if refusal["status"] == "provider_unavailable" else 2)
     elif a.model == "auto":
         return emit({"status": "usage_error", "error": f"model auto only works with a self-hosted provider, not {a.provider}"}, 2)
-    repo = git(cwd, "rev-parse", "--show-toplevel")
+    repo = None if a.answer_only else git(cwd, "rev-parse", "--show-toplevel")
     if a.worktree and not repo:
         return emit({"status": "usage_error", "error": "--worktree needs cwd inside a git repo"}, 2)
     RUNS.mkdir(parents=True, exist_ok=True)
@@ -1125,19 +1275,24 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
                     git_dir = common            # lets a worktree lane commit; not a reserved write root
             run.mkdir(parents=True)
             made_run = True
+            if a.answer_only:
+                work_cwd = Path(tempfile.mkdtemp(prefix="lane-answer-"))
             where = ""
             if worktree:   # briefs name the original checkout; some models go and work there
                 where = (f"\n\n---\nWORKING COPY: you are in {work_cwd}, a git worktree of {repo} on branch {branch}. "
                          f"Read, edit, test and commit only there. Paths under {repo} in this brief mean the same "
                          f"files in your working copy. Never change {repo} itself.")
-            (run / "brief.md").write_text(brief_text.rstrip() + where + CONTRACTS[a.kind] + "\n")
+            (run / "brief.md").write_text(brief_text if a.answer_only else
+                                         brief_text.rstrip() + where + CONTRACTS[a.kind] + "\n")
             params = {"kind": a.kind, "label": a.label or brief.stem, "provider": a.provider, "model": a.model,
                       "effort": a.effort, "sandbox": a.sandbox, "cwd": str(work_cwd), "codex_home": codex_home,
                       "tier": a.tier, "network": a.network, "add_dir": add_dirs, "git_dir": git_dir,
                       "max_time_s": a.max_time, "worktree": str(worktree) if worktree else None, "branch": branch,
                       "brief_source": str(brief), "quota_before": quota,
-                      "profile": routing.get("profile"), "routing": routing, "rules_cwd": str(cwd),
+                      "profile": routing.get("profile"), "routing": routing, "rules_cwd": a.cwd,
                       "endpoint": endpoint}
+            if a.answer_only:
+                params.update(answer_only=True, web_research=a.web_research)
             write_json(run / "params.json", params)
             # reservation is published before the supervisor exists; from here on the supervisor owns status.json
             write_json(run / "status.json", {"lane_id": lane_id, "state": "starting", "write_roots": write_roots,
@@ -1150,6 +1305,8 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
         except BaseException:
             if not launched:                # after launch, the supervisor owns the worktree and run dir
                 undo_start(repo, worktree, branch, run if made_run else None)
+                if a.answer_only and work_cwd is not None:
+                    shutil.rmtree(work_cwd, ignore_errors=True)
             raise
     finally:
         fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -1362,7 +1519,9 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("start", "run", "route"):
         s = sub.add_parser(name)
         s.add_argument("--brief", required=True)
-        s.add_argument("--cwd", required=True)
+        s.add_argument("--cwd", help="working directory (optional and ignored with --answer-only)")
+        s.add_argument("--answer-only", action="store_true", help="answer the brief in an empty cwd without coding tools")
+        s.add_argument("--web-research", action="store_true", help="allow only keyless Exa tools; requires --answer-only")
         s.add_argument("--profile", default=None, help="profile name from profiles.json, or 'auto'")
         s.add_argument("--retry-of", default=None, help="lane id to escalate from (next profile on the ladder)")
         s.add_argument("--model", default=None)
@@ -1401,6 +1560,8 @@ def main(argv: list[str]) -> int:
         return emit({"status": "usage_error", "error": str(exc)}, 2)
     try:
         return dispatch(a)
+    except UsageError as exc:
+        return emit({"status": "usage_error", "error": str(exc)}, 2)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return emit({"status": "error", "error": f"{type(exc).__name__}: {exc}"[:500]}, 1)
 
