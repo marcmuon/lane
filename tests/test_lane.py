@@ -935,6 +935,18 @@ class LaneTest(unittest.TestCase):
                               FAKE_ROLLOUT_EVENTS_FILE=raw)
         self.assertEqual((rc, r["status"], r["exa_calls"], r["disallowed_tools"]), (0, "ok", 1, []))
 
+    def test_web_research_ignores_unexposed_exa_names_in_exec(self):
+        # Oct 8 round 1: Codex tried tools.mcp__exa__crawling_exa, which failed with "is not a function".
+        source = ("text(await tools.mcp__exa__crawling_exa({url: 'u'}));\n"
+                  "text(await tools.mcp__exa__web_search_exa({query: 'x'}));")
+        rc, r = self.run_lane("--answer-only", "--web-research", FAKE_CODEX_MODE="nomarker",
+                              FAKE_CODEX_EXEC_INPUT=source)
+        self.assertNotIn("mcp__exa__crawling_exa", r["disallowed_tools"])
+        rc, r = self.run_lane("--answer-only", "--web-research",
+                              FAKE_CODEX_EXEC_INPUT="await tools.mcp__exa__web_search_exa({}); await tools.apply_patch('p')")
+        self.assertEqual((rc, r["status"]), (1, "tool_used"))
+        self.assertIn("apply_patch", r["disallowed_tools"])
+
     def test_web_research_rejects_forbidden_codex_exec_input_without_nested_events(self):
         cases = (
             ('await tools.apply_patch("patch")', "apply_patch"),

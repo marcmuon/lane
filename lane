@@ -944,7 +944,8 @@ def audit_exec_input(source) -> list[str]:
         member = re.match(r"\s*\.\s*([A-Za-z_$][\w$]*)", source[reference.end():])
         if not member:
             forbidden.add("exec:indirect_tools")
-        elif member[1] not in EXA_TOOL_NAMES:
+        elif member[1] not in EXA_TOOL_NAMES and not member[1].startswith("mcp__exa__"):
+            # Other mcp__exa__ names can't run: the server and enabled_tools expose only EXA_TOOLS.
             forbidden.add(member[1])
     # Escaped identifiers and generated code can hide the tool references above.
     if re.search(r"\\u(?:[0-9a-fA-F]{4}|\{)|\b(?:eval|Function)\b", source):
