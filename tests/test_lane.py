@@ -920,6 +920,19 @@ class LaneTest(unittest.TestCase):
                 self.assertEqual((rc, r["status"], r["exa_calls"], r["disallowed_tools"]), (0, "ok", 3, []))
                 self.assertIsNone(r["reason"])
 
+    def test_web_research_accepts_codex_0161_item_wrappers(self):
+        # Real rollout shape from Codex 0.161 (Oct 8 check): thread items wrapped in item_completed events.
+        raw = self.tmp / "raw.jsonl"
+        wrapped = [{"type": "UserMessage", "id": "u"}, {"type": "Reasoning", "id": "r"},
+                   {"type": "McpToolCall", "id": "exec-1", "server": "exa", "tool": "web_search_exa"},
+                   {"type": "AgentMessage", "id": "a"}]
+        raw.write_text("".join(json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": item}})
+                               + "\n" for item in wrapped))
+        rc, r = self.run_lane("--answer-only", "--web-research", FAKE_CODEX_MODE="nomarker",
+                              FAKE_CODEX_EXEC_INPUT="text(await tools.mcp__exa__web_search_exa({query: 'x'}));",
+                              FAKE_ROLLOUT_EVENTS_FILE=raw)
+        self.assertEqual((rc, r["status"], r["exa_calls"], r["disallowed_tools"]), (0, "ok", 1, []))
+
     def test_web_research_rejects_forbidden_codex_exec_input_without_nested_events(self):
         cases = (
             ('await tools.apply_patch("patch")', "apply_patch"),
@@ -962,6 +975,10 @@ class LaneTest(unittest.TestCase):
              "mcp__exa__unknown"),
             ("item.completed", {"type": "file_change"}, "file_change"),
             ("item.started", {"type": "future_tool"}, "future_tool"),
+            ("event_msg", {"type": "item_completed", "item": {"type": "McpToolCall", "id": "m", "server": "other",
+                                                              "tool": "web_search_exa"}}, "mcp__other__web_search_exa"),
+            ("event_msg", {"type": "item_completed", "item": {"type": "FileChange", "id": "f"}}, "item:FileChange"),
+            ("event_msg", {"type": "item_started", "item": {}}, "item:None"),
         )
         for envelope, item, forbidden in cases:
             with self.subTest(envelope=envelope, item=item):

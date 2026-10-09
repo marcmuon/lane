@@ -987,6 +987,15 @@ def audit_tool_calls(path: Path, allow_exec: bool = False) -> dict:
                     invocation = item.get("invocation") or {}
                     items = [{"type": "mcp_tool_call", "call_id": item.get("call_id"),
                               "server": invocation.get("server"), "tool": invocation.get("tool")}]
+                elif kind in ("item_started", "item_updated", "item_completed"):
+                    # Codex 0.161 wraps thread items; classify the wrapped item, failing closed.
+                    inner = item.get("item") or {}
+                    inner_kind = inner.get("type")
+                    if inner_kind == "McpToolCall":
+                        items = [{"type": "mcp_tool_call", "call_id": inner.get("id"),
+                                  "server": inner.get("server"), "tool": inner.get("tool")}]
+                    elif inner_kind not in ("UserMessage", "AgentMessage", "Reasoning"):
+                        items = [{"type": f"item:{inner_kind}", "call_id": inner.get("id")}]
                 elif kind not in (
                     "token_count", "task_started", "task_complete", "turn_started", "turn_complete", "turn_aborted",
                     "agent_message", "agent_message_delta", "agent_reasoning", "agent_reasoning_delta",
