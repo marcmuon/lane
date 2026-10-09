@@ -93,6 +93,7 @@ Your final message is your report and is read by a machine: follow the output co
 EXA_URL = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa"
 EXA_TOOLS = ("web_search_exa", "web_fetch_exa", "web_search_advanced_exa")
 EXA_TOOL_NAMES = tuple(f"mcp__exa__{tool}" for tool in EXA_TOOLS)
+CODE_MODE_FEATURES = ("code_mode", "code_mode_only", "code_mode_host", "code_mode_prewarm")
 # Codex 0.161.0 feature names. Some model-defined tools have no CLI off switch;
 # see README and the post-run audit (including the raw rollout).
 ANSWER_DISABLED_FEATURES = (
@@ -111,7 +112,10 @@ ANSWER_DISABLED_FEATURES = (
 
 def answer_instructions(p: dict) -> str:
     if p.get("web_research"):
-        return "Answer the brief directly. You may use only the three Exa web research tools. Use no other tools."
+        instructions = "Answer the brief directly. You may use only the three Exa web research tools. Use no other tools."
+        if p.get("provider") != "claude":
+            instructions += " Use exec to call them through tools.mcp__exa__<tool>; use only direct, named tool access."
+        return instructions
     return "Answer the brief directly. Do not use tools."
 
 CONTRACTS = {
@@ -817,6 +821,8 @@ def build_argv(p: dict, final_path: Path) -> tuple[list[str], dict]:
         sysfile = final_path.parent / "system.md"
         sysfile.write_text(instructions + "\n")
         for feature in ANSWER_DISABLED_FEATURES:
+            if p.get("web_research") and feature in CODE_MODE_FEATURES:
+                continue
             argv += ["--disable", feature]
         for setting in (
             'web_search="disabled"', "tools.update_plan.enabled=false",
@@ -920,13 +926,31 @@ def first_line(text: str) -> str:
     return ""
 
 
-def audit_tool_calls(path: Path) -> dict:
+def audit_exec_input(source) -> list[str]:
+    """Accept direct Exa references; indirect tool access cannot be classified safely."""
+    if not isinstance(source, str) or not source.strip():
+        return ["exec:unclassified_input"]
+    forbidden = set()
+    for reference in re.finditer(r"(?<![\w$])tools(?![\w$])", source):
+        member = re.match(r"\s*\.\s*([A-Za-z_$][\w$]*)", source[reference.end():])
+        if not member:
+            forbidden.add("exec:indirect_tools")
+        elif member[1] not in EXA_TOOL_NAMES:
+            forbidden.add(member[1])
+    # Escaped identifiers and generated code can hide the tool references above.
+    if re.search(r"\\u(?:[0-9a-fA-F]{4}|\{)|\b(?:eval|Function)\b", source):
+        forbidden.add("exec:unclassified_input")
+    return sorted(forbidden)
+
+
+def audit_tool_calls(path: Path, allow_exec: bool = False) -> dict:
     """Read Claude stream-json, Codex exec items, or raw Codex rollout calls.
 
     Count call identities once across start/update/end events. Treat unknown
     Codex item types as forbidden, so newly introduced tools fail closed.
     """
     calls = {}
+    forbidden = set()
     try:
         fh = path.open(errors="replace")
     except OSError:
@@ -954,13 +978,31 @@ def audit_tool_calls(path: Path) -> dict:
                     items = [item]
             elif t == "response_item":
                 item = ev.get("payload") or {}
-                if item.get("type", "").endswith("_call"):
+                if item.get("type") not in ("message", "reasoning", "function_call_output", "custom_tool_call_output"):
                     items = [item]
-            elif t in ("function_call", "custom_tool_call", "local_shell_call", "web_search_call"):
+            elif t == "event_msg":
+                item = ev.get("payload") or {}
+                kind = item.get("type")
+                if kind in ("mcp_tool_call_begin", "mcp_tool_call_end"):
+                    invocation = item.get("invocation") or {}
+                    items = [{"type": "mcp_tool_call", "call_id": item.get("call_id"),
+                              "server": invocation.get("server"), "tool": invocation.get("tool")}]
+                elif kind not in (
+                    "token_count", "task_started", "task_complete", "turn_started", "turn_complete", "turn_aborted",
+                    "agent_message", "agent_message_delta", "agent_reasoning", "agent_reasoning_delta",
+                    "agent_reasoning_raw_content", "agent_reasoning_raw_content_delta", "agent_reasoning_section_break",
+                    "user_message", "error", "warning", "context_compacted",
+                ):
+                    items = [item]
+            elif t.endswith("_call"):
                 items = [ev]
             for index, item in enumerate(items):
                 kind = item.get("type", "unknown")
                 name = item.get("name") or kind
+                if allow_exec and kind == "custom_tool_call" and name == "exec" and \
+                        item.get("namespace") in (None, "functions"):
+                    forbidden.update(audit_exec_input(item.get("input")))
+                    continue
                 if kind == "mcp_tool_call":
                     name = f"mcp__{item.get('server')}__{item.get('tool')}"
                 elif item.get("namespace") == "mcp__exa" and name in EXA_TOOLS:
@@ -970,12 +1012,13 @@ def audit_tool_calls(path: Path) -> dict:
                 elif item.get("namespace"):
                     name = f"{item['namespace']}.{name}"
                 call_id = item.get("call_id") or item.get("id") or f"line:{lineno}:{index}"
-                # A server-side tool with an Exa-looking name is not an MCP call.
-                if kind == "server_tool_use":
-                    name = f"server_tool_use:{name}"
+                # Unknown/server-side tools cannot impersonate an allowed MCP call.
+                if kind == "server_tool_use" or (name in EXA_TOOL_NAMES and
+                                                  kind not in ("mcp_tool_call", "function_call", "tool_use")):
+                    name = f"{kind}:{name}"
                 calls[(call_id, name)] = name
     return {"exa_calls": sum(name in EXA_TOOL_NAMES for name in calls.values()),
-            "other_tools": sorted({name for name in calls.values() if name not in EXA_TOOL_NAMES})}
+            "other_tools": sorted(forbidden | {name for name in calls.values() if name not in EXA_TOOL_NAMES})}
 
 
 def classify(rc: int | None, timed_out: bool, cancelled: bool, ev: dict, final_text: str, stderr_tail: str,
@@ -1128,11 +1171,12 @@ def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: boo
              else rollout_facts(p["codex_home"], ev.get("thread_id")))
     audit = None
     if p.get("answer_only"):
-        audit = audit_tool_calls(run / "events.jsonl")
+        allow_exec = bool(p.get("web_research") and not is_claude)
+        audit = audit_tool_calls(run / "events.jsonl", allow_exec=allow_exec)
         if facts.get("rollout"):
             # exec --json omits some tool types (e.g. view_image). The raw rollout
             # also records those calls. Its Exa calls duplicate the exec stream.
-            raw = audit_tool_calls(Path(facts["rollout"]))
+            raw = audit_tool_calls(Path(facts["rollout"]), allow_exec=allow_exec)
             audit["exa_calls"] = max(audit["exa_calls"], raw["exa_calls"])
             audit["other_tools"] = sorted(set(audit["other_tools"] + raw["other_tools"]))
         if audit["other_tools"] or (audit["exa_calls"] and not p.get("web_research")):
