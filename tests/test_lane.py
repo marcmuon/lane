@@ -766,7 +766,8 @@ class LaneTest(unittest.TestCase):
                                          ("read-only", False, [], None))
                         self.assertIsNone(params["rules_cwd"])
                         system = ("Answer the brief directly. You may use only the three Exa web research tools. "
-                                  "Use no other tools." if web else "Answer the brief directly. Do not use tools.")
+                                  "Use no other tools." + LANE_MODULE.EXA_PACING if web
+                                  else "Answer the brief directly. Do not use tools.")
                         if web and provider == "openai":
                             system += " Use exec to call them through tools.mcp__exa__<tool>; use only direct, named tool access."
                         self.assertEqual((run / "system.md").read_text(), system + "\n")
@@ -774,7 +775,8 @@ class LaneTest(unittest.TestCase):
                         self.assertEqual(argv[1:], d["argv"])
                         if provider == "claude":
                             expected = [str(FAKE_CLAUDE), "-p", "--output-format", "stream-json", "--verbose",
-                                        "--model", model, "--effort", "medium", "--max-turns", "8" if web else "2",
+                                        "--model", model, "--effort", "medium",
+                                        "--max-turns", str(LANE_MODULE.CLAUDE_RESEARCH_TURNS) if web else "2",
                                         "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
                                         "--strict-mcp-config", "--disable-slash-commands", "--system-prompt-file",
                                         str(run / "system.md"), "--permission-mode", "dontAsk", "--tools", ""]

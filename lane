@@ -110,9 +110,18 @@ ANSWER_DISABLED_FEATURES = (
 )
 
 
+# Keyless Exa refuses bursts, and full-text results can exceed what the model may read.
+EXA_PACING = (" Exa's free tier refuses bursts: make one tool call at a time, never several at once."
+              " Keep results small: at most 5 results per search, highlights rather than full page text,"
+              " and maxCharacters of at most 4000 when reading a page. If a call reports a rate limit,"
+              " continue with what you have and retry that search once, later.")
+CLAUDE_RESEARCH_TURNS = 40
+
+
 def answer_instructions(p: dict) -> str:
     if p.get("web_research"):
-        instructions = "Answer the brief directly. You may use only the three Exa web research tools. Use no other tools."
+        instructions = ("Answer the brief directly. You may use only the three Exa web research tools."
+                        " Use no other tools." + EXA_PACING)
         if p.get("provider") != "claude":
             instructions += " Use exec to call them through tools.mcp__exa__<tool>; use only direct, named tool access."
         return instructions
@@ -708,7 +717,7 @@ def build_claude_argv(p: dict, run: Path) -> tuple[list[str], dict]:
         sysfile.write_text(answer_instructions(p) + "\n")
         argv = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose",
                 "--model", p["model"], "--effort", p["effort"],
-                "--max-turns", "8" if p.get("web_research") else "2",
+                "--max-turns", str(CLAUDE_RESEARCH_TURNS) if p.get("web_research") else "2",
                 "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
                 "--strict-mcp-config", "--disable-slash-commands", "--system-prompt-file", str(sysfile),
                 "--permission-mode", "dontAsk", "--tools", ""]
