@@ -457,6 +457,18 @@ class LaneTest(unittest.TestCase):
         self.assertNotIn("No such file", session)
         self.assertEqual((repo / "shape.py").read_text(), "\nvalue = 2\n\n")
 
+    def test_orchestrator_plan_prose_becomes_the_workers_opening_message(self):
+        repo, sha, plan, items = self.prewalk_fixture()
+        plan.write_text(json.dumps({"todo": items, "plan": "UNIQUE-PLAN: touch shape.py, then run its tests."}))
+        _, r = self.prewalk_lane(repo, sha, plan)
+        session = [json.loads(l) for l in (Path(r["run_dir"]) / "prewalk_session.jsonl").read_text().splitlines()]
+        own = [c["text"] for o in session if o.get("type") == "response_item"
+               and o["payload"].get("type") == "message" and o["payload"].get("role") == "assistant"
+               for c in o["payload"]["content"]]
+        self.assertIn("UNIQUE-PLAN: touch shape.py, then run its tests.", own)
+        _, b = self.prewalk_lane(repo, sha, plan, "--provider", "claude", "--model", "opus")
+        self.assertIn("UNIQUE-PLAN", (Path(b["run_dir"]) / "brief.md").read_text())
+
     def test_bootstrap_and_splice_failures_fall_back_to_the_complete_brief(self):
         repo, sha, plan, items = self.prewalk_fixture()
         for mode in ("fail", "missing", "unknown_shape", "malformed"):
@@ -511,7 +523,7 @@ class LaneTest(unittest.TestCase):
         resumed, boot = json.loads(dump.read_text()), json.loads(bootstrap_dump.read_text())
         argv = resumed["argv"]
         self.assertEqual(argv[:3], ["exec", "resume", r["session_id"]])
-        self.assertEqual((resumed["cwd"], resumed["prompt"]), (r["cwd"], "Continue."))
+        self.assertEqual((resumed["cwd"], resumed["prompt"]), (r["cwd"], LANE_MODULE.PREWALK_RESUME))
         self.assertIn('model_reasoning_effort="max"', argv)
         self.assertIn('sandbox_mode="workspace-write"', argv)
         self.assertIn("sandbox_workspace_write.network_access=true", argv)

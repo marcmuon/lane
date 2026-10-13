@@ -98,6 +98,16 @@ EXA_TOOL_NAMES = tuple(f"mcp__exa__{tool}" for tool in EXA_TOOLS)
 CODE_MODE_FEATURES = ("code_mode", "code_mode_only", "code_mode_host", "code_mode_prewarm")
 CONTEXT_MAX_BYTES = 200 * 1024
 HOLDOUT_TIMEOUT_S = 30 * 60
+# Adapted from oh-my-pi's prewalk-continue.md and prewalk-checklist.md (the steer OMP adds after its model swap).
+PREWALK_RESUME = ("Continue the task now; do not end your turn here.\n\n"
+                  "Before you report the task complete, verify:\n"
+                  "- Consistency: if a pattern, signature or check changed in one place, grep every other call site or "
+                  "duplicate copy that needs the same change. A fix at only some matching sites fails.\n"
+                  "- Scope: if the diff exceeds the minimal change that resolves the task, confirm behavior is unchanged "
+                  "outside it. Prefer the smallest correct diff over a broader rewrite.\n"
+                  "- Verification: run the full test module or file, not only the test you expect to flip. Never modify "
+                  "tests or verification assets to pass checks.\n"
+                  "Do not claim the task complete until all three checks are done.")
 PREWALK_RULE = ("The demonstrated pattern is a settled design decision: extend it to the remaining cases; "
                 "do not redesign it, do not re-implement it in parallel elsewhere, and do not delete and rewrite it. "
                 "If the pattern cannot work for a case, say so explicitly in your final report instead of silently diverging.")
@@ -913,16 +923,19 @@ def build_argv(p: dict, final_path: Path) -> tuple[list[str], dict]:
 
 # ---------- prewalk trajectory ----------
 
-def load_prewalk_plan(path: Path) -> tuple[list[dict], list[str] | None]:
+def load_prewalk_plan(path: Path) -> tuple[list[dict], list[str] | None, str | None]:
     try:
         data = json.loads(path.read_text())
     except (OSError, UnicodeError, ValueError) as exc:
         raise UsageError(f"can't read --prewalk-plan {path}: {exc}") from None
-    reads = None
+    reads = plan_text = None
     if isinstance(data, dict):
-        if "todo" not in data or set(data) - {"todo", "reads"}:
-            raise UsageError("--prewalk-plan object must contain todo and optionally reads")
+        if "todo" not in data or set(data) - {"todo", "reads", "plan"}:
+            raise UsageError("--prewalk-plan object must contain todo and optionally reads and plan")
         reads = data.get("reads")
+        plan_text = data.get("plan")
+        if "plan" in data and (not isinstance(plan_text, str) or not plan_text.strip() or len(plan_text) > 20_000):
+            raise UsageError("--prewalk-plan plan must be non-empty text up to 20,000 characters")
         if "reads" in data and (not isinstance(reads, list) or any(
                 not isinstance(name, str) or not name.strip() or "\0" in name or Path(name).is_absolute() or
                 ".." in Path(name).parts or not Path(name).parts for name in reads)):
@@ -936,7 +949,7 @@ def load_prewalk_plan(path: Path) -> tuple[list[dict], list[str] | None]:
             raise UsageError("--prewalk-plan items must contain only non-empty step and check strings")
         if "\0" in item["check"]:
             raise UsageError("--prewalk-plan check cannot contain a null byte")
-    return data, reads
+    return data, reads, plan_text
 
 
 def prewalk_git(repo: str | Path, *args: str) -> str:
@@ -1062,7 +1075,8 @@ def splice_prewalk_session(rollout: Path, run: Path, p: dict, thread: str) -> No
     commit = p["prewalk"]
     changes = prewalk_changes(repo, commit)
     add({"type": "message", "role": "assistant", "phase": "commentary", "content": [
-        {"type": "output_text", "text": "I'll read the relevant files, make a short checklist, and start on the first item."}]})
+        {"type": "output_text", "text": p.get("prewalk_text") or
+         "I'll read the relevant files, make a short checklist, and start on the first item."}]})
     for name in p["prewalk_reads"]:
         # New files have no pre-edit contents. Record the failed read rather than inventing a file.
         exists = git(repo, "cat-file", "-e", f"{commit}^:{name}") is not None
@@ -1108,7 +1122,7 @@ def build_resume_argv(argv: list[str], thread: str) -> list[str]:
             i += 1
     if roots:
         resumed += ["-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}"]
-    return resumed + ["Continue."]
+    return resumed + [PREWALK_RESUME]
 
 
 # ---------- classification ----------
@@ -1589,13 +1603,13 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
     a.protect = a.protect or []
     if a.prewalk_plan is not None and a.prewalk is None:
         raise UsageError("--prewalk-plan requires --prewalk SHA")
-    prewalk_items, prewalk_reads = [], None
+    prewalk_items, prewalk_reads, prewalk_text = [], None, None
     if a.prewalk_plan is not None:
         try:
             plan_path = Path(a.prewalk_plan).expanduser().resolve()
         except (OSError, RuntimeError, ValueError) as exc:
             raise UsageError(f"can't resolve --prewalk-plan: {exc}") from None
-        prewalk_items, prewalk_reads = load_prewalk_plan(plan_path)
+        prewalk_items, prewalk_reads, prewalk_text = load_prewalk_plan(plan_path)
         a.prewalk_plan = str(plan_path)
     if a.web_research and not a.answer_only:
         raise UsageError("--web-research requires --answer-only")
@@ -1668,6 +1682,8 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
                 for name in prewalk_reads:
                     if not parent or git(repo, "cat-file", "-t", f"{commit}^:{name}") != "blob":
                         raise UsageError(f"--prewalk-plan read is not a file at the commit's parent: {name}")
+            if prewalk_text:
+                prewalk_section += "\n\nPlan:\n" + prewalk_text.strip()
             prewalk_section += "\n\nTodo (item 1 is already implemented by this commit):\n" + "\n".join(
                 f"{i}. {item['step']}\n   Check: {item['check']}" for i, item in enumerate(prewalk_items, 1))
     if route_only:
@@ -1807,7 +1823,7 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
                       "profile": routing.get("profile"), "routing": routing, "rules_cwd": a.cwd,
                       "endpoint": endpoint, "context": a.context, "holdout": a.holdout, "protect": a.protect,
                       "prewalk": a.prewalk, "prewalk_plan": a.prewalk_plan,
-                      "prewalk_items": prewalk_items, "prewalk_reads": prewalk_reads,
+                      "prewalk_items": prewalk_items, "prewalk_reads": prewalk_reads, "prewalk_text": prewalk_text,
                       "prewalk_result": prewalk_result, "prewalk_section": prewalk_section,
                       "protect_root": str(protect_root), "protected_hashes": protected_hashes}
             if prewalk_items:
