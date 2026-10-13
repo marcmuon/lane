@@ -13,11 +13,13 @@ mode = os.environ.get("FAKE_CODEX_MODE", "ok_task")
 final = Path(args[args.index("--output-last-message") + 1])
 model = args[args.index("-m") + 1]
 effort = next((a.split("=", 1)[1].strip('"') for a in args if a.startswith("model_reasoning_effort=")), None)
-prompt = sys.stdin.read()
+resumed = len(args) > 1 and args[1] == "resume"
+prompt = args[-1] if resumed else sys.stdin.read()
+bootstrap = prompt == "Reply with exactly READY."
 if os.environ.get("FAKE_CODEX_DUMP"):
     Path(os.environ["FAKE_CODEX_DUMP"]).write_text(json.dumps({
         "argv": args, "cwd": os.getcwd(), "cwd_files": os.listdir(), "prompt": prompt}))
-thread = str(uuid.uuid4())
+thread = args[2] if resumed else str(uuid.uuid4())
 home = Path(os.environ["CODEX_HOME"])
 used = float(os.environ.get("FAKE_USED", "40"))
 resets = int(os.environ.get("FAKE_RESETS", str(int(time.time()) + 3 * 86400)))
@@ -31,7 +33,9 @@ def rollout(used_after):
     d = home / "sessions" / time.strftime("%Y/%m/%d")
     d.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
-    with (d / f"rollout-{time.strftime('%Y-%m-%dT%H-%M-%S')}-{thread}.jsonl").open("w") as fh:
+    path = next(d.glob(f"rollout-*-{thread}.jsonl"), None) if resumed else None
+    path = path or d / f"rollout-{time.strftime('%Y-%m-%dT%H-%M-%S')}-{thread}.jsonl"
+    with path.open("a" if resumed else "w") as fh:
         fh.write(json.dumps({"timestamp": ts, "type": "turn_context", "payload": {
             "model": model, "collaboration_mode": {"settings": {"reasoning_effort": effort}}}}) + "\n")
         fh.write(json.dumps({"timestamp": ts, "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
@@ -52,6 +56,51 @@ if os.environ.get("FAKE_CODEX_ENV_DUMP"):
     Path(os.environ["FAKE_CODEX_ENV_DUMP"]).write_text(json.dumps({"LANE_SPARK_KEY": os.environ.get("LANE_SPARK_KEY")}))
 ev({"type": "thread.started", "thread_id": thread})
 ev({"type": "turn.started"})
+if bootstrap:
+    # Entirely synthetic: no user/account identifiers or content from real rollouts.
+    bootstrap_mode = os.environ.get("FAKE_CODEX_BOOTSTRAP_MODE", "ok")
+    if os.environ.get("FAKE_CODEX_BOOTSTRAP_DUMP"):
+        Path(os.environ["FAKE_CODEX_BOOTSTRAP_DUMP"]).write_text(json.dumps({"argv": args, "cwd": os.getcwd(), "prompt": prompt}))
+    if bootstrap_mode == "fail":
+        ev({"type": "turn.failed", "error": {"message": "synthetic bootstrap failure"}})
+        sys.exit(1)
+    if bootstrap_mode == "slow":
+        time.sleep(float(os.environ.get("FAKE_CODEX_SLEEP", "5")))
+    if bootstrap_mode != "missing":
+        d = home / "sessions" / time.strftime("%Y/%m/%d")
+        d.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        records = [
+            {"type": "session_meta", "payload": {"id": thread, "cwd": os.getcwd()}},
+            {"type": "response_item", "payload": {"type": "message", "role": "developer", "content": [
+                {"type": "input_text", "text": "Synthetic worker instructions."}]}},
+            {"type": "turn_context", "payload": {"model": model, "effort": effort}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": prompt}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": prompt}]}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "READY"}]}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "READY"}},
+        ]
+        if bootstrap_mode == "unknown_shape":
+            records[4]["payload"]["content"] = [{"type": "input_text", "text": "Unexpected prompt"}]
+        path = d / f"rollout-{time.strftime('%Y-%m-%dT%H-%M-%S')}-{thread}.jsonl"
+        path.write_text("{invalid json\n" if bootstrap_mode == "malformed" else "".join(
+            json.dumps({"timestamp": ts, "ordinal": i, **record}) + "\n" for i, record in enumerate(records)))
+    final.write_text("READY")
+    ev({"type": "item.completed", "item": {"type": "agent_message", "text": "READY"}})
+    ev({"type": "turn.completed", "usage": {"input_tokens": 12, "output_tokens": 1}})
+    sys.exit(0)
+if resumed:
+    unsupported = {"-s", "--sandbox", "-C", "--cd", "--add-dir"}.intersection(args)
+    if unsupported:
+        ev({"type": "turn.failed", "error": {"message": f"resume does not accept {sorted(unsupported)}"}})
+        sys.exit(2)
+    paths = list((home / "sessions").glob(f"**/rollout-*-{thread}.jsonl"))
+    history = [json.loads(line) for line in paths[0].read_text().splitlines()]
+    if os.environ.get("FAKE_CODEX_DUMP"):
+        Path(os.environ["FAKE_CODEX_DUMP"]).write_text(json.dumps({
+            "argv": args, "cwd": os.getcwd(), "cwd_files": os.listdir(), "prompt": prompt, "history": history}))
 if os.environ.get("FAKE_EVENTS_FILE"):
     for line in Path(os.environ["FAKE_EVENTS_FILE"]).read_text().splitlines():
         ev(json.loads(line))

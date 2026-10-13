@@ -34,14 +34,15 @@ Other `start` flags: `--kind task|review`, `--sandbox read-only|workspace-write`
 
 ### Context, checks, and prewalk
 
-`start`, `run`, and `route` accept these handoff flags. `route` previews routing without launching a worker or running the holdout.
+`start`, `run`, and `route` accept these handoff flags. `route` validates the inputs and previews routing without launching a worker or running checks.
 
 | Flag | Behavior |
 |---|---|
 | `--context PATH` | Repeatable existing file, resolved from the caller's directory. Coding briefs get a CONTEXT section naming files to read first for goals, decisions, and rules. Repository files are copied into the worktree and named by their working-copy paths, including uncommitted contents; external files retain their original paths. Answer-only and web-research briefs include each file's contents under a separate header, capped at 200 KB (204,800 bytes) total. Invalid files or excessive inline context yield `usage_error`. Source paths are recorded in `params.json`. |
 | `--holdout CMD` | One non-empty shell command. Lane tells the worker about it, then runs it outside the worker sandbox in the worker's cwd after exit. The timeout is 30 minutes; `run` waits for both the worker and this check. Combined stdout and stderr are saved in the run directory's `holdout.log`. |
 | `--protect PATH` | Repeatable file or directory relative to the repository root, or cwd outside Git. Requires `--holdout`. Absolute paths, parent traversal, and symlinks escaping the working copy are rejected. The brief forbids edits and deletions. Lane hashes the paths before launch and compares afterward, including directory contents, names, file types, permissions, and symlink targets. Missing paths are recorded too, so creating one counts as a change. |
-| `--prewalk SHA` | Commit demonstrating the design to extend. Requires cwd in a Git repository and a commit that is an ancestor of `HEAD`; invalid inputs yield `usage_error`. Lane records the resolved commit in `params.json` and appends its short SHA, subject, `git show --stat` file list, and the rule below to the coding brief. |
+| `--prewalk SHA` | Commit demonstrating the design to extend. Requires cwd in a Git repository and a commit that is an ancestor of `HEAD`; invalid inputs yield `usage_error`. Lane records the resolved commit in `params.json`. Without a plan, it appends its short SHA, subject, `git show --stat` file list, and the rule below to the coding brief. |
+| `--prewalk-plan FILE` | Requires `--prewalk SHA`. JSON todo array or an object containing `todo` and optional `reads`. There must be 1–8 items, each containing only non-empty string fields `step` and `check`. Item 1 describes the prewalk commit. `reads` is a list of repo-relative files present at the commit's parent; omitting it selects files touched by the commit. An empty reads list is allowed. Absolute paths, parent traversal, missing explicit reads, unknown fields, or malformed JSON yield `usage_error`. The resolved plan path is saved in `params.json`. |
 
 Examples, one for each handoff:
 
@@ -52,13 +53,42 @@ lane run --brief /tmp/task.md --cwd ~/code/app --profile implement \
 lane run --brief /tmp/remaining-cases.md --cwd ~/code/app --profile implement --prewalk HEAD
 ```
 
-The prewalk rule is appended verbatim:
+In brief mode the prewalk rule is appended verbatim:
 
 > The demonstrated pattern is a settled design decision: extend it to the remaining cases; do not redesign it, do not re-implement it in parallel elsewhere, and do not delete and rewrite it. If the pattern cannot work for a case, say so explicitly in your final report instead of silently diverging.
 
+With a plan, Lane first runs item 1's check outside the worker sandbox in the working cwd, after creating the worktree and copying context. Combined stdout and stderr are saved in `prewalk_check.log`. The check runs once, with a timeout of the smaller of `--max-time` and 30 minutes. A non-zero exit (including timeout) returns `usage_error` before bootstrap or worker launch and removes the newly created run and worktree.
+
+For `openai`, `deepseek`, and `spark`, trajectory mode bootstraps a session with the worker's model, provider, permissions, developer instructions, and lowest effort (`low`). Lane replaces the bootstrap user turn with the full coding brief, including context, working-copy instructions, holdout, and output contract, without the PREWALK section. It discards the bootstrap reply and events, then appends assistant commentary and paired `exec` tool calls/outputs: reads of the commit's parent, the plan with item 1 in progress, the commit as an `apply_patch` using absolute working-copy paths, the real first-check output, and the plan with item 1 completed and item 2 in progress. For a one-item plan, all items are completed. Default reads of added files record their absence before the edit. No reasoning items are forged.
+
+The rollout is saved in the worker's `CODEX_HOME/sessions` and copied to the run's `prewalk_session.jsonl`. Lane launches `codex exec resume <thread_id> ... "Continue."` in the working cwd, preserving the normal model, effort, sandbox, network, developer instructions, and output flags. Resume's unsupported `-s` and `--add-dir` flags become `sandbox_mode` and `sandbox_workspace_write.writable_roots` config overrides; process cwd replaces `-C`. Bootstrap shares the worker's wall-clock deadline, cancellation, and process-group cleanup. Normal worker events, quota accounting, and holdout checks continue to apply; the recorded model and effort come from the latest rollout turn.
+
+Claude uses brief mode. A bootstrap failure, missing session file, unrecognized rollout, or unsupported patch (including a root commit with no parent) also falls back to the normal worker invocation, with the existing PREWALK section and every todo item/check added to `brief.md`. Results and `result.json` always include `prewalk`: `null` without a commit, otherwise `{mode, commit, items, bootstrap_usage}`, with `reason` added in brief mode. `items` contains the supplied step/check objects, or an empty list for a commit-only handoff. `bootstrap_usage` contains Codex's token counters from bootstrap, or `{}` if no usage was reported. Normal worker token counters remain in `tokens`.
+
+Worked example: the orchestrator reads `app/shapes.py` and `tests/test_shapes.py`, adds negative-radius validation to `area`, checks it with `python3 -m unittest tests.test_shapes.TestShapes.test_area_negative`, and commits those files. Its `/tmp/shapes-plan.json` describes the first edit and remaining work:
+
+```json
+{
+  "todo": [
+    {"step": "Reject negative radii in area", "check": "python3 -m unittest tests.test_shapes.TestShapes.test_area_negative"},
+    {"step": "Apply the same validation to circumference", "check": "python3 -m unittest tests.test_shapes.TestShapes.test_circumference_negative"},
+    {"step": "Verify all shape calculations", "check": "python3 -m unittest tests.test_shapes"}
+  ],
+  "reads": ["app/shapes.py", "tests/test_shapes.py"]
+}
+```
+
+With `/tmp/shapes-brief.md` describing the overall task, run:
+
+```bash
+lane run --brief /tmp/shapes-brief.md --cwd ~/code/app --profile implement-light \
+  --prewalk HEAD --prewalk-plan /tmp/shapes-plan.json \
+  --holdout 'python3 -m unittest tests.test_shapes'
+```
+
 Results always include `holdout`: `null` without `--holdout`, otherwise `{cmd, exit_code, passed, tampered, log}`. `passed` is true only for exit code 0 with no changed protected paths. `tampered` lists the protected arguments whose snapshots changed or could no longer be read; the check covers changes made by the worker or the command. `log` is the absolute path to the full output. Timeouts return holdout exit code 124. If the worker could not launch or its process group is still alive, the check is skipped with a null exit code and `passed: false`. A holdout failure does not change the top-level worker `status` or Lane exit code: callers must inspect `holdout.passed`.
 
-`--retry-of ID` inherits the previous run's `context`, `holdout`, `protect`, and `prewalk` from `params.json`. Passing a flag again replaces that setting; repeatable flags replace the whole previous list. Settings are independent: replacing the command still retains the protected paths unless `--protect` is passed again. Paths and commits are validated for the new run, and protected snapshots are taken again in its working copy.
+`--retry-of ID` inherits the previous run's `context`, `holdout`, `protect`, `prewalk`, and `prewalk_plan` from `params.json`. Passing a flag again replaces that setting; repeatable flags replace the whole previous list. Settings are independent: replacing the command still retains the protected paths unless `--protect` is passed again. Paths, plans, and commits are validated for the new run, and protected snapshots and the first-item check are taken again in its working copy. Keep the plan file available for retries.
 
 ### Results and exit codes
 
@@ -103,7 +133,7 @@ A write lane reserves its whole repository checkout (or its own worktree), plus 
 
 ## Worker isolation
 
-Codex workers run without your user config, hooks, MCP servers or nested agents; Claude workers get the repo's project settings and no MCP servers. Every lane runs with an explicit model and effort, and the result also records the model the worker reported (and, for Codex, the effort). Secret-looking environment variables are stripped. A wall-clock limit kills the worker's whole process group, and if any of it survives, the lane ends in `error` and keeps its paths reserved. A worktree lane's brief also names its working copy, so a model that follows the brief's `Repo:` path doesn't edit the original checkout. The report must open with `STATUS: DONE|BLOCKED` or `VERDICT: LGTM|REVISE`. Lane checks this report format; the caller still needs to assess the result.
+Codex workers run without your user config, hooks, MCP servers or nested agents; Claude workers get the repo's project settings and no MCP servers. Every Codex task lane enables `tools.update_plan.enabled=true`, and the task contract requires keeping at most eight todo items in the plan tool, each with its proving check, updating them as work proceeds. Answer-only lanes keep the plan tool disabled. Every lane runs with an explicit model and effort, and the result also records the model the worker reported (and, for Codex, the effort). Secret-looking environment variables are stripped. A wall-clock limit kills the worker's whole process group, and if any of it survives, the lane ends in `error` and keeps its paths reserved. A worktree lane's brief also names its working copy, so a model that follows the brief's `Repo:` path doesn't edit the original checkout. The report must open with `STATUS: DONE|BLOCKED` or `VERDICT: LGTM|REVISE`. Lane checks this report format; the caller still needs to assess the result.
 
 Lane imposes no word or length limit on worker reports. Workers follow the level of detail requested in the brief, and the JSON result's `summary` contains the full report without truncation.
 
@@ -186,7 +216,7 @@ Then run `lane run --brief ... --cwd ... --profile spark`. `auto` routing never 
 | `LANE_SPARK_BASE_URL`, `LANE_SPARK_KEYCHAIN_SERVICE` | | self-hosted server, if not set in your profiles file |
 | `LANE_DEEPSEEK_CATALOG` | | experimental DeepSeek provider |
 
-Each run lives in `$LANE_STATE/runs/<lane_id>/`, which can hold `brief.md` (with handoff sections and the output contract appended), `params.json`, `argv.json`, `events.jsonl`, `stderr.log`, `holdout.log`, `final.md` and `result.json`.
+Each run lives in `$LANE_STATE/runs/<lane_id>/`, which can hold `brief.md` (with handoff sections and the output contract appended), `params.json`, `argv.json`, `events.jsonl`, `stderr.log`, `holdout.log`, `final.md` and `result.json`. Planned prewalks also save `prewalk_check.log`; bootstrap attempts add `bootstrap_argv.json`, `bootstrap_prompt.md`, `bootstrap_events.jsonl`, `bootstrap_stderr.log`, and `bootstrap_final.md`. Successful splices save `prewalk_session.jsonl` before the worker resumes.
 
 ## Tests
 

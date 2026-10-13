@@ -11,7 +11,7 @@ Commands:
   lane start  --brief FILE --cwd DIR [--model M] [--effort E] [--kind task|review] [--sandbox read-only|workspace-write]
               [--worktree] [--label L] [--max-time 60m] [--provider openai|claude|deepseek|spark] [--tier default|fast|flex]
               [--network] [--add-dir DIR]... [--codex-home DIR] [--wait-slot SECONDS] [--force]
-              [--context PATH]... [--holdout CMD] [--protect PATH]... [--prewalk SHA]
+              [--context PATH]... [--holdout CMD] [--protect PATH]... [--prewalk SHA] [--prewalk-plan FILE]
   lane wait   ID [--max SECONDS]         block until the lane finishes (or --max elapses: status=running, exit 3)
   lane run    (same flags as start)      start + wait until finished
   lane route  (same flags as start)      print the routing decision; launches nothing
@@ -35,6 +35,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -100,6 +101,7 @@ HOLDOUT_TIMEOUT_S = 30 * 60
 PREWALK_RULE = ("The demonstrated pattern is a settled design decision: extend it to the remaining cases; "
                 "do not redesign it, do not re-implement it in parallel elsewhere, and do not delete and rewrite it. "
                 "If the pattern cannot work for a case, say so explicitly in your final report instead of silently diverging.")
+PREWALK_BOOTSTRAP_PROMPT = "Reply with exactly READY."
 # Codex 0.161.0 feature names. Some model-defined tools have no CLI off switch;
 # see README and the post-run audit (including the raw rollout).
 ANSWER_DISABLED_FEATURES = (
@@ -137,7 +139,8 @@ CONTRACTS = {
     "task": "\n\n---\nOUTPUT CONTRACT (required): the first line of your final message is exactly `STATUS: DONE` or "
             "`STATUS: BLOCKED`. Then report what changed (files), the acceptance command you ran and its "
             "result, and anything left open. Follow the brief's requested level of detail; "
-            "Lane imposes no word or length limit.",
+            "Lane imposes no word or length limit. Keep your todo list in the plan tool, at most 8 items, "
+            "each with the check that proves it, and update it as you work.",
     "review": "\n\n---\nOUTPUT CONTRACT (required): the first line of your final message is exactly `VERDICT: LGTM` or "
               "`VERDICT: REVISE`. Then numbered findings (most severe first), each with file:line, what is wrong, "
               "and the fix. No praise, no summary of the change. Follow the brief's requested level of detail; "
@@ -855,6 +858,8 @@ def build_argv(p: dict, final_path: Path) -> tuple[list[str], dict]:
             argv += ["-c", f"mcp_servers.exa.url={json.dumps(EXA_URL)}",
                      "-c", f"mcp_servers.exa.enabled_tools={json.dumps(EXA_TOOLS)}",
                      "-c", "mcp_servers.exa.required=true"]
+    elif p["kind"] == "task" or p.get("prewalk_plan"):
+        argv += ["-c", "tools.update_plan.enabled=true"]
     env = worker_env()
     env["CODEX_HOME"] = p["codex_home"]
     if p["provider"] == "openai" and p["tier"] != "default":
@@ -904,6 +909,206 @@ def build_argv(p: dict, final_path: Path) -> tuple[list[str], dict]:
         argv += ["--add-dir", d]
     argv.append("-")
     return argv, env
+
+
+# ---------- prewalk trajectory ----------
+
+def load_prewalk_plan(path: Path) -> tuple[list[dict], list[str] | None]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise UsageError(f"can't read --prewalk-plan {path}: {exc}") from None
+    reads = None
+    if isinstance(data, dict):
+        if "todo" not in data or set(data) - {"todo", "reads"}:
+            raise UsageError("--prewalk-plan object must contain todo and optionally reads")
+        reads = data.get("reads")
+        if "reads" in data and (not isinstance(reads, list) or any(
+                not isinstance(name, str) or not name.strip() or "\0" in name or Path(name).is_absolute() or
+                ".." in Path(name).parts or not Path(name).parts for name in reads)):
+            raise UsageError("--prewalk-plan reads must be a list of repo-relative file paths")
+        data = data["todo"]
+    if not isinstance(data, list) or not 1 <= len(data) <= 8:
+        raise UsageError("--prewalk-plan must have 1-8 todo items")
+    for item in data:
+        if not isinstance(item, dict) or set(item) != {"step", "check"} or any(
+                not isinstance(item[key], str) or not item[key].strip() for key in ("step", "check")):
+            raise UsageError("--prewalk-plan items must contain only non-empty step and check strings")
+        if "\0" in item["check"]:
+            raise UsageError("--prewalk-plan check cannot contain a null byte")
+    return data, reads
+
+
+def prewalk_git(repo: str | Path, *args: str) -> str:
+    """Read commit data without stripping file contents or allowing external diff helpers."""
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8")
+    if result.returncode:
+        raise ValueError(f"can't read prewalk commit data: {result.stderr.strip()[:300]}")
+    return result.stdout
+
+
+def prewalk_changes(repo: str | Path, commit: str) -> list[tuple[str, str]]:
+    names = prewalk_git(repo, "diff-tree", "--no-commit-id", "--no-renames", "--name-status", "-z", "-r",
+                        commit + "^", commit).split("\0")
+    return list(zip(names[0:-1:2], names[1:-1:2]))
+
+
+def prewalk_patch(repo: Path, commit: str, changes: list[tuple[str, str]]) -> str:
+    patch = ["*** Begin Patch"]
+    for status, name in changes:
+        absolute = str(repo / name)
+        if "\n" in absolute or "\r" in absolute or status not in ("A", "M", "D"):
+            raise ValueError(f"unsupported prewalk change: {status} {name!r}")
+        revisions = [commit + "^"] if status == "D" else [commit] if status == "A" else [commit + "^", commit]
+        modes = [prewalk_git(repo, "ls-tree", "-z", revision, "--", name).split(" ", 1)[0]
+                 for revision in revisions]
+        if any(mode not in ("100644", "100755") for mode in modes) or len(set(modes)) > 1:
+            raise ValueError(f"prewalk patch cannot represent file type or mode changes: {name}")
+        if status == "D":
+            patch.append(f"*** Delete File: {absolute}")
+        elif status == "A":
+            contents = prewalk_git(repo, "show", f"{commit}:{name}")
+            if "\0" in contents:
+                raise ValueError(f"binary prewalk file: {name}")
+            patch.append(f"*** Add File: {absolute}")
+            patch.extend("+" + line for line in contents.splitlines())
+        else:
+            diff = prewalk_git(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "-U3",
+                               commit + "^", commit, "--", name).splitlines()
+            hunk = next((i for i, line in enumerate(diff) if line.startswith("@@")), None)
+            if hunk is None:
+                raise ValueError(f"prewalk change has no text patch: {name}")
+            patch.append(f"*** Update File: {absolute}")
+            patch.extend("@@" if line.startswith("@@") else line for line in diff[hunk:]
+                         if not line.startswith("\\ No newline at end of file"))
+    if len(patch) == 1:
+        raise ValueError("prewalk commit has no file edits")
+    return "\n".join(patch + ["*** End Patch"])
+
+
+def run_prewalk_check(run: Path, cwd: Path, command: str, timeout: float) -> dict:
+    log = run / "prewalk_check.log"
+    started = time.time()
+    with log.open("wb") as output:
+        proc = subprocess.Popen(command, shell=True, cwd=cwd, stdin=subprocess.DEVNULL,
+                                stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            code = 124
+            output.write(b"\nPrewalk check timed out.\n")
+        finally:
+            stop_group(proc.pid, reap=proc.poll)
+            proc.wait(timeout=KILL_GRACE_S)
+    return {"exit_code": code, "wall_time_seconds": round(time.time() - started, 3),
+            "output": log.read_text(errors="replace")}
+
+
+def splice_prewalk_session(rollout: Path, run: Path, p: dict, thread: str) -> None:
+    records = [json.loads(line) for line in rollout.read_text().splitlines() if line.strip()]
+    if not records or any(not isinstance(record, dict) or not isinstance(record.get("payload"), dict)
+                          for record in records):
+        raise ValueError("unknown bootstrap rollout shape")
+    if records[0].get("type") != "session_meta" or records[0]["payload"].get("id") != thread:
+        raise ValueError("bootstrap rollout has no matching session metadata")
+    keep = []
+    for record in records:
+        payload = record["payload"]
+        if record.get("type") == "response_item":
+            if payload.get("type") != "message" or not isinstance(payload.get("content"), list):
+                raise ValueError("unknown bootstrap response item")
+            if payload.get("role") == "user" and payload["content"] == [
+                    {"type": "input_text", "text": PREWALK_BOOTSTRAP_PROMPT}]:
+                payload["content"] = [{"type": "input_text", "text": (run / "brief.md").read_text()}]
+                keep.append(record)
+                break
+            if payload.get("role") not in ("system", "developer", "user"):
+                raise ValueError("unexpected bootstrap reply before prompt")
+        elif record.get("type") not in ("session_meta", "turn_context", "event_msg"):
+            raise ValueError("unknown bootstrap rollout record")
+        if record.get("type") != "event_msg":
+            keep.append(record)
+    else:
+        raise ValueError("bootstrap user message missing")
+
+    ordinal = max((record.get("ordinal", 0) for record in keep), default=0)
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    call_number = 0
+
+    def add(payload):
+        nonlocal ordinal
+        ordinal += 1
+        keep.append({"timestamp": timestamp, "ordinal": ordinal, "type": "response_item", "payload": payload})
+
+    def call(js, output):
+        nonlocal call_number
+        call_number += 1
+        call_id = f"call_prewalk_{call_number}"
+        add({"type": "custom_tool_call", "status": "completed", "call_id": call_id, "name": "exec", "input": js})
+        add({"type": "custom_tool_call_output", "call_id": call_id, "output": [
+            {"type": "input_text", "text": "Script completed\nOutput:\n"},
+            {"type": "input_text", "text": output}]})
+
+    def command_output(result):
+        return json.dumps({"chunk_id": "prewalk", "original_token_count": len(result["output"]) // 4, **result})
+
+    def plan(done):
+        steps = [{"step": f"{item['step']} Check: {item['check']}",
+                  "status": "completed" if i < done else "in_progress" if i == done else "pending"}
+                 for i, item in enumerate(p["prewalk_items"])]
+        call(f"text(await tools.update_plan({json.dumps({'plan': steps})}));\n", "Plan updated")
+
+    repo = Path(p["worktree"] or git(p["cwd"], "rev-parse", "--show-toplevel"))
+    commit = p["prewalk"]
+    changes = prewalk_changes(repo, commit)
+    add({"type": "message", "role": "assistant", "phase": "commentary", "content": [
+        {"type": "output_text", "text": "I'll read the relevant files, make a short checklist, and start on the first item."}]})
+    for name in p["prewalk_reads"]:
+        # New files have no pre-edit contents. Record the failed read rather than inventing a file.
+        exists = git(repo, "cat-file", "-e", f"{commit}^:{name}") is not None
+        output = prewalk_git(repo, "show", f"{commit}^:{name}") if exists else f"cat: {repo / name}: No such file or directory\n"
+        command = {"cmd": "cat -- " + shlex.quote(str(repo / name)), "workdir": p["cwd"]}
+        call(f"text(await tools.exec_command({json.dumps(command)}));\n",
+             command_output({"output": output, "exit_code": 0 if exists else 1, "wall_time_seconds": 0.0}))
+    plan(0)
+    patch = prewalk_patch(repo, commit, changes)
+    changed = "\n".join(f"{status} {repo / name}" for status, name in changes)
+    call(f"text(await tools.apply_patch({json.dumps(patch)}));\n", f"Success. Updated the following files:\n{changed}\n")
+    command = {"cmd": p["prewalk_items"][0]["check"], "workdir": p["cwd"]}
+    call(f"text(await tools.exec_command({json.dumps(command)}));\n", command_output(p["prewalk_check"]))
+    plan(1)
+    contents = "".join(json.dumps(record) + "\n" for record in keep)
+    (run / "prewalk_session.jsonl").write_text(contents)
+    temporary = rollout.with_name(rollout.name + ".prewalk.tmp")
+    try:
+        temporary.write_text(contents)
+        os.replace(temporary, rollout)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def build_resume_argv(argv: list[str], thread: str) -> list[str]:
+    resumed = [argv[0], "exec", "resume", thread]
+    roots = []
+    i = 2
+    while i < len(argv):
+        flag = argv[i]
+        if flag == "-s":
+            resumed += ["-c", f"sandbox_mode={json.dumps(argv[i + 1])}"]
+            i += 2
+        elif flag == "-C":
+            i += 2  # resume uses the process cwd
+        elif flag == "--add-dir":
+            roots.append(argv[i + 1])
+            i += 2
+        elif flag == "-" and i == len(argv) - 1:
+            i += 1
+        else:
+            resumed.append(flag)
+            i += 1
+    if roots:
+        resumed += ["-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}"]
+    return resumed + ["Continue."]
 
 
 # ---------- classification ----------
@@ -1084,7 +1289,6 @@ def rollout_facts(codex_home: str, thread_id: str | None) -> dict:
                 p = (json.loads(line).get("payload") or {})
                 facts["model_verified"] = p.get("model")
                 facts["effort_recorded"] = p.get("effort") or ((p.get("collaboration_mode") or {}).get("settings") or {}).get("reasoning_effort")
-                break
     except (OSError, ValueError):
         pass
     return facts
@@ -1180,35 +1384,14 @@ def run_holdout(run: Path, p: dict, worker_exited: bool) -> dict | None:
             "tampered": tampered, "log": str(log)}
 
 
-def supervise(lane_id: str) -> int:
-    run = RUNS / lane_id
-    p = read_json(run / "params.json")
-    status = read_json(run / "status.json")
-    if not p or not status:
-        return 1
-    status["supervisor_pid"] = os.getpid()
-    write_json(run / "status.json", status)
-    final_path, events_path, stderr_path = run / "final.md", run / "events.jsonl", run / "stderr.log"
-    for f in (final_path, events_path, stderr_path):
-        f.unlink(missing_ok=True)
-    started = time.time()
-    if (run / "cancel").exists():
-        return finish(run, p, status, rc=None, timed_out=False, cancelled=True, started=started)
-    try:
-        argv, env = build_claude_argv(p, run) if p["provider"] == "claude" else build_argv(p, final_path)
-    except UsageError as exc:
-        return finish(run, p, status, rc=None, timed_out=False, cancelled=False, started=started, setup_error=str(exc))
-    secret = env.get("LANE_SPARK_KEY") or (env.get("DEEPSEEK_API_KEY") if p["provider"] == "deepseek" else "") or ""
-    write_json(run / "argv.json", {"argv": argv})
-    if (run / "cancel").exists():      # a cancel may land while build_argv waits on Keychain
-        return finish(run, p, status, rc=None, timed_out=False, cancelled=True, started=started)
-    with (run / "brief.md").open("rb") as stdin, events_path.open("wb") as out, stderr_path.open("wb") as err:
+def execute_worker(run: Path, p: dict, status: dict, argv: list[str], env: dict, started: float,
+                   prompt: Path | None, events_path: Path, stderr_path: Path) -> tuple:
+    with (prompt or Path(os.devnull)).open("rb") as stdin, events_path.open("wb") as out, stderr_path.open("wb") as err:
         try:
             proc = subprocess.Popen(argv, cwd=p["cwd"], stdin=stdin, stdout=out, stderr=err, env=env,
                                     start_new_session=True)
-        except FileNotFoundError:
-            return finish(run, p, status, rc=None, timed_out=False, cancelled=False, started=started,
-                          setup_error=f"{argv[0]} not found")
+        except OSError as exc:
+            return None, False, False, True, f"could not launch {argv[0]}: {exc}"
         timed_out = cancelled = False
         try:
             status.update(state="running", codex_pid=proc.pid, codex_pgid=proc.pid, started_at=started)
@@ -1234,8 +1417,76 @@ def supervise(lane_id: str) -> int:
             proc.wait(timeout=KILL_GRACE_S)
         except subprocess.TimeoutExpired:
             pass
-    return finish(run, p, status, rc=proc.returncode, timed_out=timed_out, cancelled=cancelled, started=started,
-                  setup_error="" if stopped else STUCK_GROUP, stuck=not stopped, secret=secret)
+    return proc.returncode, timed_out, cancelled, stopped, "" if stopped else STUCK_GROUP
+
+
+def supervise(lane_id: str) -> int:
+    run = RUNS / lane_id
+    p = read_json(run / "params.json")
+    status = read_json(run / "status.json")
+    if not p or not status:
+        return 1
+    status["supervisor_pid"] = os.getpid()
+    write_json(run / "status.json", status)
+    final_path, events_path, stderr_path = run / "final.md", run / "events.jsonl", run / "stderr.log"
+    for f in (final_path, events_path, stderr_path):
+        f.unlink(missing_ok=True)
+    started = time.time()
+    if (run / "cancel").exists():
+        return finish(run, p, status, rc=None, timed_out=False, cancelled=True, started=started)
+    try:
+        argv, env = build_claude_argv(p, run) if p["provider"] == "claude" else build_argv(p, final_path)
+    except UsageError as exc:
+        return finish(run, p, status, rc=None, timed_out=False, cancelled=False, started=started, setup_error=str(exc))
+    secret = env.get("LANE_SPARK_KEY") or (env.get("DEEPSEEK_API_KEY") if p["provider"] == "deepseek" else "") or ""
+    if (run / "cancel").exists():      # a cancel may land while build_argv waits on Keychain
+        return finish(run, p, status, rc=None, timed_out=False, cancelled=True, started=started)
+    resumed = False
+    if (p.get("prewalk_result") or {}).get("mode") == "trajectory":
+        bootstrap_argv = ['model_reasoning_effort="low"' if arg.startswith("model_reasoning_effort=") else arg
+                          for arg in argv]
+        bootstrap_argv[bootstrap_argv.index("--output-last-message") + 1] = str(run / "bootstrap_final.md")
+        write_json(run / "bootstrap_argv.json", {"argv": bootstrap_argv})
+        bootstrap_prompt = run / "bootstrap_prompt.md"
+        bootstrap_prompt.write_text(PREWALK_BOOTSTRAP_PROMPT)
+        bootstrap_events, bootstrap_stderr = run / "bootstrap_events.jsonl", run / "bootstrap_stderr.log"
+        rc, timed_out, cancelled, stopped, error = execute_worker(
+            run, p, status, bootstrap_argv, env, started, bootstrap_prompt, bootstrap_events, bootstrap_stderr)
+        ev = parse_events(bootstrap_events)
+        p["prewalk_result"]["bootstrap_usage"] = ev["usage"]
+        if timed_out or cancelled or not stopped:
+            write_json(run / "params.json", p)
+            return finish(run, p, status, rc=rc, timed_out=timed_out, cancelled=cancelled, started=started,
+                          setup_error=error, stuck=not stopped, secret=secret)
+        reason = error or (f"bootstrap failed: {ev['fatal'] or f'exit {rc}'}" if rc != 0 or ev["fatal"] else "")
+        if not reason:
+            try:
+                thread = ev["thread_id"]
+                if not isinstance(thread, str) or not re.fullmatch(r"[A-Za-z0-9-]+", thread):
+                    raise ValueError("bootstrap thread id missing or invalid")
+                rollouts = list((Path(p["codex_home"]) / "sessions").glob(f"**/rollout-*-{thread}.jsonl"))
+                if len(rollouts) != 1:
+                    raise ValueError("bootstrap session file missing or ambiguous")
+                splice_prewalk_session(rollouts[0], run, p, thread)
+            except (OSError, ValueError, TypeError) as exc:
+                reason = f"splice failed: {exc}"
+            else:
+                argv = build_resume_argv(argv, thread)
+                resumed = True
+        if reason:
+            p["prewalk_result"].update(mode="brief", reason=redact(reason, secret))
+            (run / "prewalk_session.jsonl").unlink(missing_ok=True)
+            brief = (run / "brief.md").read_text()
+            contract = CONTRACTS[p["kind"]] + "\n"
+            (run / "brief.md").write_text(brief.removesuffix(contract) + p["prewalk_section"] + contract)
+        write_json(run / "params.json", p)
+    write_json(run / "argv.json", {"argv": argv})
+    if (run / "cancel").exists():
+        return finish(run, p, status, rc=None, timed_out=False, cancelled=True, started=started, secret=secret)
+    rc, timed_out, cancelled, stopped, error = execute_worker(
+        run, p, status, argv, env, started, None if resumed else run / "brief.md", events_path, stderr_path)
+    return finish(run, p, status, rc=rc, timed_out=timed_out, cancelled=cancelled, started=started,
+                  setup_error=error, stuck=not stopped, secret=secret)
 
 
 STUCK_GROUP = "worker process group survived SIGKILL; its write roots stay reserved until it exits"
@@ -1308,7 +1559,7 @@ def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: boo
         "quota_delta_raw": raw_delta, "quota_delta": delta, "overlapping_lanes": overlap,
         "run_dir": str(run), "finished_at": ended,
         "profile": p.get("profile"), "routing": p.get("routing"),
-        "holdout": holdout,
+        "holdout": holdout, "prewalk": p.get("prewalk_result"),
     }
     if audit is not None:
         result.update(answer_only=True, web_research=p.get("web_research", False),
@@ -1331,11 +1582,21 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
     brief = Path(a.brief).expanduser().resolve()
     if a.retry_of:
         previous = read_json(RUNS / a.retry_of / "params.json") or {}
-        for field in ("context", "holdout", "protect", "prewalk"):
+        for field in ("context", "holdout", "protect", "prewalk", "prewalk_plan"):
             if getattr(a, field) is None:
                 setattr(a, field, previous.get(field))
     a.context = a.context or []
     a.protect = a.protect or []
+    if a.prewalk_plan is not None and a.prewalk is None:
+        raise UsageError("--prewalk-plan requires --prewalk SHA")
+    prewalk_items, prewalk_reads = [], None
+    if a.prewalk_plan is not None:
+        try:
+            plan_path = Path(a.prewalk_plan).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise UsageError(f"can't resolve --prewalk-plan: {exc}") from None
+        prewalk_items, prewalk_reads = load_prewalk_plan(plan_path)
+        a.prewalk_plan = str(plan_path)
     if a.web_research and not a.answer_only:
         raise UsageError("--web-research requires --answer-only")
     if a.answer_only and (a.worktree or a.network or a.add_dir or a.sandbox == "workspace-write"):
@@ -1399,6 +1660,16 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
         subject = git(cwd, "show", "-s", "--format=%s", commit, "--")
         files = git(cwd, "show", "--stat", "--format=", "--no-ext-diff", commit, "--")
         prewalk_section = f"\n\n---\nPREWALK: {short} {subject}\n\n{files}\n\n{PREWALK_RULE}"
+        if prewalk_items:
+            parent = git(repo, "rev-parse", "--verify", commit + "^")
+            if prewalk_reads is None:
+                prewalk_reads = [name for _, name in prewalk_changes(repo, commit)] if parent else []
+            else:
+                for name in prewalk_reads:
+                    if not parent or git(repo, "cat-file", "-t", f"{commit}^:{name}") != "blob":
+                        raise UsageError(f"--prewalk-plan read is not a file at the commit's parent: {name}")
+            prewalk_section += "\n\nTodo (item 1 is already implemented by this commit):\n" + "\n".join(
+                f"{i}. {item['step']}\n   Check: {item['check']}" for i, item in enumerate(prewalk_items, 1))
     if route_only:
         return emit({"status": "routed", "profile": routing.get("profile"), "provider": a.provider, "model": a.model, "effort": a.effort,
                      "kind": a.kind, "sandbox": a.sandbox, "worktree": a.worktree, "max_time_s": a.max_time,
@@ -1512,7 +1783,20 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
                                    f"outside the worker sandbox (30-minute timeout):\n{a.holdout}\n"
                                    f"Protected paths (relative to {protect_root}): do not edit or delete them.\n"
                                    + ("\n".join(f"- {name}" for name in a.protect) or "(none)"))
-            additions = context_section + prewalk_section + holdout_section
+            prewalk_result = None
+            if a.prewalk is not None:
+                trajectory = bool(prewalk_items and a.provider != "claude")
+                prewalk_result = {"mode": "trajectory" if trajectory else "brief", "commit": a.prewalk,
+                                  "items": prewalk_items, "bootstrap_usage": {}}
+                if not trajectory:
+                    prewalk_result["reason"] = "claude provider uses brief handoff" if a.provider == "claude" else "no --prewalk-plan supplied"
+            if prewalk_items:
+                prewalk_check = run_prewalk_check(run, work_cwd, prewalk_items[0]["check"],
+                                                  min(a.max_time, HOLDOUT_TIMEOUT_S))
+                if prewalk_check["exit_code"] != 0:
+                    raise UsageError(f"prewalk item 1 check failed (exit {prewalk_check['exit_code']}): "
+                                     f"{prewalk_items[0]['check']}\n{prewalk_check['output'][-2000:]}")
+            additions = context_section + ("" if prewalk_result and prewalk_result["mode"] == "trajectory" else prewalk_section) + holdout_section
             (run / "brief.md").write_text(brief_text + additions if a.answer_only else
                                          brief_text.rstrip() + where + additions + CONTRACTS[a.kind] + "\n")
             params = {"kind": a.kind, "label": a.label or brief.stem, "provider": a.provider, "model": a.model,
@@ -1522,7 +1806,12 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
                       "brief_source": str(brief), "quota_before": quota,
                       "profile": routing.get("profile"), "routing": routing, "rules_cwd": a.cwd,
                       "endpoint": endpoint, "context": a.context, "holdout": a.holdout, "protect": a.protect,
-                      "prewalk": a.prewalk, "protect_root": str(protect_root), "protected_hashes": protected_hashes}
+                      "prewalk": a.prewalk, "prewalk_plan": a.prewalk_plan,
+                      "prewalk_items": prewalk_items, "prewalk_reads": prewalk_reads,
+                      "prewalk_result": prewalk_result, "prewalk_section": prewalk_section,
+                      "protect_root": str(protect_root), "protected_hashes": protected_hashes}
+            if prewalk_items:
+                params["prewalk_check"] = prewalk_check
             if a.answer_only:
                 params.update(answer_only=True, web_research=a.web_research)
             write_json(run / "params.json", params)
@@ -1760,6 +2049,7 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--holdout", help="shell command Lane runs after the worker, outside its sandbox")
         s.add_argument("--protect", action="append", help="repo-relative file or directory the worker must not edit; repeatable")
         s.add_argument("--prewalk", help="ancestor commit demonstrating the settled implementation pattern")
+        s.add_argument("--prewalk-plan", help="JSON file with 1-8 step/check todo items; requires --prewalk SHA")
         s.add_argument("--model", default=None)
         s.add_argument("--effort", default=None, choices=EFFORTS)
         s.add_argument("--kind", default=None, choices=("task", "review"))

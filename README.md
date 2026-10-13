@@ -105,7 +105,34 @@ Use `--prewalk SHA` to hand over a real edit demonstrating the pattern to extend
 lane run --brief /tmp/remaining-cases.md --cwd ~/code/app --profile implement --prewalk HEAD
 ```
 
-All these flags work with `start` and `run`. `--retry-of ID` carries forward each previous context, holdout, protect, and prewalk setting unless you provide that flag again. See the [handoff reference](docs/reference.md#context-checks-and-prewalk) for validation and result fields.
+Add `--prewalk-plan FILE` to hand over a trajectory, following [Stencil's prewalk](https://stencil.so/blog/prewalk). The orchestrator explores the code, writes a todo list of **1–8 items with a check per item**, makes the first edit, verifies it, and commits it. Item 1 describes that commit; the worker continues with item 2.
+
+For example, after reading `app/shapes.py` and `tests/test_shapes.py`, the orchestrator adds negative-radius validation to `area`, runs its test, and commits those two files. It saves `/tmp/shapes-plan.json`:
+
+```json
+{
+  "todo": [
+    {"step": "Reject negative radii in area", "check": "python3 -m unittest tests.test_shapes.TestShapes.test_area_negative"},
+    {"step": "Apply the same validation to circumference", "check": "python3 -m unittest tests.test_shapes.TestShapes.test_circumference_negative"},
+    {"step": "Verify all shape calculations", "check": "python3 -m unittest tests.test_shapes"}
+  ],
+  "reads": ["app/shapes.py", "tests/test_shapes.py"]
+}
+```
+
+With the overall task in `/tmp/shapes-brief.md`, it hands off the commit and plan:
+
+```bash
+lane run --brief /tmp/shapes-brief.md --cwd ~/code/app --profile implement-light \
+  --prewalk HEAD --prewalk-plan /tmp/shapes-plan.json \
+  --holdout 'python3 -m unittest tests.test_shapes'
+```
+
+Lane reruns item 1's check in the working copy before any worker starts; a failure returns `usage_error`. For OpenAI, DeepSeek, and Spark workers, it bootstraps a Codex session, replaces the bootstrap turn with the full task brief, and adds the pre-edit reads, todo updates, committed patch, and real check output as that worker's own tool history. The worker resumes with its normal model and effort and item 1 completed. The session copy is saved as `prewalk_session.jsonl` in the run directory. Every Codex task lane gets the plan tool and an instruction to keep at most eight todo items with checks.
+
+You can also supply just the todo array; reads then default to files touched by the commit. Claude and failed bootstrap/splice attempts use brief mode with the commit, todo, and checks. Inspect `prewalk.mode`, `prewalk.reason` for a fallback, and `prewalk.bootstrap_usage` for bootstrap tokens; `prewalk` is `null` without a commit.
+
+All these flags work with `start` and `run`. `--retry-of ID` carries forward each previous context, holdout, protect, prewalk commit, and prewalk-plan file setting unless you provide that flag again. See the [handoff reference](docs/reference.md#context-checks-and-prewalk) for validation and result fields.
 
 ## Answer a brief or research the web
 

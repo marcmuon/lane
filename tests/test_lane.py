@@ -383,6 +383,230 @@ class LaneTest(unittest.TestCase):
         rc, r = self.lane("run", "--brief", str(self.brief), "--cwd", str(repo), "--answer-only", "--prewalk", base)
         self.assertEqual((rc, r["status"]), (2, "usage_error"))
 
+    def prewalk_fixture(self, first_check="printf 'checked\\n'"):
+        repo = self.git_repo()
+        def git(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        (repo / "shape.py").write_text("\nvalue = 1\n\n")
+        (repo / "legacy.py").write_text("legacy = True\n")
+        (repo / "guide.md").write_text("Read this guidance.\n")
+        git("add", "-A")
+        git("commit", "-qm", "base")
+        (repo / "shape.py").write_text("\nvalue = 2\n\n")
+        (repo / "legacy.py").unlink()
+        (repo / "new 'file'.py").write_text("added = True\n")
+        (repo / "empty.txt").touch()
+        git("add", "-A")
+        git("commit", "-qm", "first edit")
+        plan = self.tmp / "todo.json"
+        items = [{"step": "Apply the first edit", "check": first_check},
+                 {"step": "Finish the remaining cases", "check": "true"}]
+        plan.write_text(json.dumps(items))
+        return repo, git("rev-parse", "HEAD"), plan, items
+
+    def prewalk_lane(self, repo, sha, plan, *extra, **env):
+        return self.lane("run", "--brief", str(self.brief), "--cwd", str(repo), "--worktree",
+                         "--sandbox", "workspace-write", "--prewalk", sha, "--prewalk-plan", str(plan),
+                         *extra, **env)
+
+    def test_prewalk_patch_handles_add_update_delete_and_empty_files(self):
+        repo, sha, plan, items = self.prewalk_fixture("printf 'checked\\n'; printf 'check stderr\\n' >&2")
+        rc, r = self.prewalk_lane(repo, sha, plan)
+        self.assertEqual((rc, r["status"], r["prewalk"]["mode"]), (0, "ok", "trajectory"))
+        self.assertEqual((r["prewalk"]["commit"], r["prewalk"]["items"]), (sha, items))
+        run = Path(r["run_dir"])
+        records = [json.loads(line) for line in (run / "prewalk_session.jsonl").read_text().splitlines()]
+        calls = [record["payload"]["input"] for record in records
+                 if record["type"] == "response_item" and record["payload"]["type"] == "custom_tool_call"]
+        patch_call = next(call for call in calls if "tools.apply_patch(" in call)
+        patch = json.loads(patch_call.split("tools.apply_patch(", 1)[1].removesuffix("));\n"))
+        working = Path(r["worktree"])
+        added = working / "new 'file'.py"
+        for expected in (f"*** Add File: {added}\n+added = True",
+                         f"*** Add File: {working / 'empty.txt'}\n",
+                         f"*** Delete File: {working / 'legacy.py'}",
+                         f"*** Update File: {working / 'shape.py'}\n@@",
+                         "-value = 1\n+value = 2"):
+            self.assertIn(expected, patch)
+        plans = [json.loads(call.split("tools.update_plan(", 1)[1].removesuffix("));\n"))["plan"]
+                 for call in calls if "tools.update_plan(" in call]
+        self.assertEqual([[item["status"] for item in entries] for entries in plans],
+                         [["in_progress", "pending"], ["completed", "in_progress"]])
+        self.assertEqual(plans[-1][0]["step"], f"{items[0]['step']} Check: {items[0]['check']}")
+        outputs = [record["payload"]["output"][1]["text"] for record in records
+                   if record["type"] == "response_item" and record["payload"]["type"] == "custom_tool_call_output"]
+        chunks = [json.loads(output) for output in outputs if output.startswith("{")]
+        self.assertIn("\nvalue = 1\n\n", [chunk["output"] for chunk in chunks])
+        self.assertIn("legacy = True\n", [chunk["output"] for chunk in chunks])
+        self.assertEqual(chunks[-1]["output"], "checked\ncheck stderr\n")
+        self.assertEqual(chunks[-1]["exit_code"], 0)
+        session = (run / "prewalk_session.jsonl").read_text()
+        self.assertNotIn("READY", session)
+        self.assertNotIn("PREWALK:", session)
+        self.assertFalse(any(record["type"] == "event_msg" for record in records))
+
+    def test_object_prewalk_plan_reads_only_requested_parent_files(self):
+        repo, sha, plan, items = self.prewalk_fixture()
+        plan.write_text(json.dumps({"todo": items, "reads": ["guide.md", "legacy.py"]}))
+        _, r = self.prewalk_lane(repo, sha, plan)
+        self.assertEqual(r["prewalk"]["mode"], "trajectory")
+        session = (Path(r["run_dir"]) / "prewalk_session.jsonl").read_text()
+        self.assertIn("Read this guidance.", session)
+        self.assertIn("legacy = True", session)
+        self.assertNotIn("No such file", session)
+        self.assertEqual((repo / "shape.py").read_text(), "\nvalue = 2\n\n")
+
+    def test_bootstrap_and_splice_failures_fall_back_to_the_complete_brief(self):
+        repo, sha, plan, items = self.prewalk_fixture()
+        for mode in ("fail", "missing", "unknown_shape", "malformed"):
+            with self.subTest(mode=mode):
+                rc, r = self.prewalk_lane(repo, sha, plan, FAKE_CODEX_BOOTSTRAP_MODE=mode)
+                self.assertEqual((rc, r["status"], r["prewalk"]["mode"]), (0, "ok", "brief"))
+                self.assertIn("bootstrap" if mode == "fail" else "splice", r["prewalk"]["reason"])
+                self.assertEqual(r["prewalk"]["bootstrap_usage"], {} if mode == "fail" else
+                                 {"input_tokens": 12, "output_tokens": 1})
+                run = Path(r["run_dir"])
+                self.assertFalse((run / "prewalk_session.jsonl").exists())
+                self.assertNotIn("resume", json.loads((run / "argv.json").read_text())["argv"])
+                brief = (run / "brief.md").read_text()
+                self.assertIn("PREWALK:", brief)
+                self.assertIn(sha[:7], brief)
+                for item in items:
+                    self.assertIn(item["step"], brief)
+                    self.assertIn(item["check"], brief)
+
+    def test_prewalk_symlink_commit_falls_back_instead_of_forging_a_regular_file(self):
+        repo, _, plan, _ = self.prewalk_fixture()
+        (repo / "link.md").symlink_to("guide.md")
+        subprocess.run(["git", "-C", str(repo), "add", "link.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-qm", "add symlink"], check=True)
+        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                             capture_output=True, text=True).stdout.strip()
+        rc, r = self.prewalk_lane(repo, sha, plan)
+        self.assertEqual((rc, r["status"], r["prewalk"]["mode"]), (0, "ok", "brief"))
+        self.assertIn("file type or mode", r["prewalk"]["reason"])
+        self.assertTrue((Path(r["worktree"]) / "link.md").is_symlink())
+        self.assertFalse((Path(r["run_dir"]) / "prewalk_session.jsonl").exists())
+
+    def test_root_prewalk_commit_falls_back_when_it_has_no_parent(self):
+        repo = self.git_repo()
+        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                             capture_output=True, text=True).stdout.strip()
+        plan = self.tmp / "root-plan.json"
+        plan.write_text(json.dumps([{"step": "Initialize the repository", "check": "true"}]))
+        rc, r = self.prewalk_lane(repo, sha, plan)
+        self.assertEqual((rc, r["status"], r["prewalk"]["mode"]), (0, "ok", "brief"))
+        self.assertIn("splice failed", r["prewalk"]["reason"])
+
+    def test_resume_keeps_worker_configuration_and_verifies_its_latest_effort(self):
+        repo, sha, plan, _ = self.prewalk_fixture()
+        dump = self.tmp / "resumed.json"
+        bootstrap_dump = self.tmp / "bootstrap.json"
+        rc, r = self.prewalk_lane(repo, sha, plan, "--model", "gpt-6-luna", "--effort", "max", "--network",
+                                  "--add-dir", str(self.work), FAKE_CODEX_DUMP=dump,
+                                  FAKE_CODEX_BOOTSTRAP_DUMP=bootstrap_dump)
+        self.assertEqual((rc, r["model_verified"], r["effort_recorded"]), (0, "gpt-6-luna", "max"))
+        resumed, boot = json.loads(dump.read_text()), json.loads(bootstrap_dump.read_text())
+        argv = resumed["argv"]
+        self.assertEqual(argv[:3], ["exec", "resume", r["session_id"]])
+        self.assertEqual((resumed["cwd"], resumed["prompt"]), (r["cwd"], "Continue."))
+        self.assertIn('model_reasoning_effort="max"', argv)
+        self.assertIn('sandbox_mode="workspace-write"', argv)
+        self.assertIn("sandbox_workspace_write.network_access=true", argv)
+        self.assertIn('approval_policy="never"', argv)
+        roots = json.loads(next(arg.split("=", 1)[1] for arg in argv
+                                if arg.startswith("sandbox_workspace_write.writable_roots=")))
+        params = json.loads((Path(r["run_dir"]) / "params.json").read_text())
+        self.assertEqual(roots, [str(self.work.resolve())] + params["git_dir"])
+        self.assertIn("tools.update_plan.enabled=true", argv)
+        self.assertIn('model_reasoning_effort="low"', boot["argv"])
+        self.assertEqual(boot["argv"][boot["argv"].index("-m") + 1], "gpt-6-luna")
+        self.assertEqual(r["prewalk"]["bootstrap_usage"], {"input_tokens": 12, "output_tokens": 1})
+        self.assertIn("Do the bounded thing.", json.dumps(resumed["history"]))
+
+    def test_deepseek_prewalk_resumes_with_its_provider_configuration(self):
+        repo, sha, plan, _ = self.prewalk_fixture()
+        rc, r = self.prewalk_lane(repo, sha, plan, "--provider", "deepseek", "--model", "deepseek-test",
+                                  DEEPSEEK_API_KEY="synthetic-deepseek-key")
+        self.assertEqual((rc, r["status"], r["prewalk"]["mode"]), (0, "ok", "trajectory"))
+        run = Path(r["run_dir"])
+        for filename in ("argv.json", "bootstrap_argv.json"):
+            argv = json.loads((run / filename).read_text())["argv"]
+            self.assertIn('model_provider="deepseek"', argv)
+            self.assertIn('model_providers.deepseek.env_key="DEEPSEEK_API_KEY"', argv)
+            self.assertEqual(argv[argv.index("-m") + 1], "deepseek-test")
+        self.assertNotIn("synthetic-deepseek-key", (run / "prewalk_session.jsonl").read_text())
+
+    def test_prewalk_bootstrap_obeys_the_worker_deadline(self):
+        repo, sha, plan, _ = self.prewalk_fixture()
+        rc, r = self.prewalk_lane(repo, sha, plan, "--max-time", "2s",
+                                  FAKE_CODEX_BOOTSTRAP_MODE="slow", FAKE_CODEX_SLEEP=30)
+        self.assertEqual((rc, r["status"]), (1, "timeout"))
+        run = Path(r["run_dir"])
+        self.assertFalse((run / "argv.json").exists())
+        self.assertFalse((run / "prewalk_session.jsonl").exists())
+        status = json.loads((run / "status.json").read_text())
+        self.assertEqual(status["state"], "done")
+        self.assertFalse(LANE_MODULE.group_alive(status["codex_pgid"]))
+
+    def test_invalid_prewalk_plans_are_usage_errors_before_launch(self):
+        repo, sha, plan, items = self.prewalk_fixture()
+        invalid = [None, {}, [], items * 5, [{"step": "s"}], [{"step": "s", "check": " "}],
+                   [{"step": 1, "check": "true"}], [{"step": "s", "check": "true", "extra": "bad"}],
+                   {"todo": items, "extra": []}, {"todo": items, "reads": None},
+                   {"todo": items, "reads": "guide.md"}, {"todo": items, "reads": [1]},
+                   {"todo": items, "reads": ["../outside"]}, {"todo": items, "reads": [str(repo / "guide.md")]},
+                   {"todo": items, "reads": ["null\0path"]}, [{"step": "s", "check": "true\0"}],
+                   {"todo": items, "reads": [""]}, {"todo": items, "reads": ["."]},
+                   {"todo": items, "reads": ["missing.md"]}, {"todo": items, "reads": ["new 'file'.py"]}]
+        for data in invalid:
+            with self.subTest(data=data):
+                plan.write_text(json.dumps(data))
+                rc, r = self.prewalk_lane(repo, sha, plan)
+                self.assertEqual((rc, r["status"]), (2, "usage_error"))
+        plan.write_text("{invalid")
+        self.assertEqual(self.prewalk_lane(repo, sha, plan)[1]["status"], "usage_error")
+        plan.unlink()
+        self.assertEqual(self.prewalk_lane(repo, sha, plan)[1]["status"], "usage_error")
+        self.assertFalse(any(self.home.glob("sessions/**/*.jsonl")))
+
+    def test_prewalk_check_runs_once_in_working_cwd_before_bootstrap(self):
+        check = "test ! -f first-check.txt && printf 'once' > first-check.txt"
+        repo, sha, plan, _ = self.prewalk_fixture(check)
+        rc, r = self.prewalk_lane(repo, sha, plan, "--holdout", "test \"$(cat first-check.txt)\" = once")
+        self.assertEqual((rc, r["status"], r["holdout"]["passed"]), (0, "ok", True))
+        self.assertFalse((repo / "first-check.txt").exists())
+        self.assertEqual((Path(r["cwd"]) / "first-check.txt").read_text(), "once")
+
+    def test_failed_prewalk_check_cleans_up_and_never_bootstraps(self):
+        repo, sha, plan, _ = self.prewalk_fixture("printf 'failure evidence\\n'; exit 7")
+        dump = self.tmp / "bootstrap.json"
+        rc, r = self.prewalk_lane(repo, sha, plan, FAKE_CODEX_BOOTSTRAP_DUMP=dump)
+        self.assertEqual((rc, r["status"]), (2, "usage_error"))
+        self.assertIn("failure evidence", r["error"])
+        self.assertFalse(dump.exists())
+        self.assertFalse(any(self.home.glob("sessions/**/*.jsonl")))
+        self.assertFalse(any((self.tmp / "worktrees").glob("lane-*")))
+        self.assertFalse(any((self.tmp / "state" / "runs").glob("*/params.json")))
+
+    def test_single_item_prewalk_finishes_its_plan(self):
+        repo, sha, plan, items = self.prewalk_fixture()
+        plan.write_text(json.dumps({"todo": items[:1], "reads": []}))
+        _, r = self.prewalk_lane(repo, sha, plan)
+        self.assertEqual(r["prewalk"]["mode"], "trajectory")
+        records = [json.loads(line) for line in (Path(r["run_dir"]) / "prewalk_session.jsonl").read_text().splitlines()]
+        calls = [record["payload"]["input"] for record in records
+                 if record["type"] == "response_item" and record["payload"]["type"] == "custom_tool_call"]
+        self.assertIn('"status": "completed"', calls[-1])
+        self.assertNotIn('"status": "in_progress"', calls[-1])
+
+    def test_prewalk_result_is_null_without_a_commit(self):
+        rc, r = self.run_lane()
+        self.assertEqual((rc, r["status"]), (0, "ok"))
+        self.assertIsNone(r["prewalk"])
+
     def test_retry_explicit_handoff_flags_replace_previous_settings(self):
         repo = self.git_repo()
         def git(*args):
