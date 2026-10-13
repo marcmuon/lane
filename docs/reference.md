@@ -3,6 +3,7 @@
 [Back to the quick start](../README.md)
 
 - [Commands](#commands)
+- [Context, checks, and prewalk](#context-checks-and-prewalk)
 - [Result example](#result-example)
 - [Quota checks](#quota-checks)
 - [Checkout locking](#checkout-locking)
@@ -30,6 +31,34 @@ lane cancel <lane_id>
 Every command prints one JSON line on stdout. The exceptions: in a terminal, `status` and `result` print readable text (`LANE_JSON=1` keeps JSON), `watch` always prints text, and `--help` prints help.
 
 Other `start` flags: `--kind task|review`, `--sandbox read-only|workspace-write`, `--worktree`, `--max-time 45m`, `--model` and `--effort` (each overrides one field of the profile), `--provider`, `--add-dir DIR`, `--network`, `--codex-home DIR`, `--wait-slot SECONDS` (wait for a free slot instead of returning `busy`), `--label`, and `--force` (skip the quota checks).
+
+### Context, checks, and prewalk
+
+`start`, `run`, and `route` accept these handoff flags. `route` previews routing without launching a worker or running the holdout.
+
+| Flag | Behavior |
+|---|---|
+| `--context PATH` | Repeatable existing file, resolved from the caller's directory. Coding briefs get a CONTEXT section naming files to read first for goals, decisions, and rules. Repository files are copied into the worktree and named by their working-copy paths, including uncommitted contents; external files retain their original paths. Answer-only and web-research briefs include each file's contents under a separate header, capped at 200 KB (204,800 bytes) total. Invalid files or excessive inline context yield `usage_error`. Source paths are recorded in `params.json`. |
+| `--holdout CMD` | One non-empty shell command. Lane tells the worker about it, then runs it outside the worker sandbox in the worker's cwd after exit. The timeout is 30 minutes; `run` waits for both the worker and this check. Combined stdout and stderr are saved in the run directory's `holdout.log`. |
+| `--protect PATH` | Repeatable file or directory relative to the repository root, or cwd outside Git. Requires `--holdout`. Absolute paths, parent traversal, and symlinks escaping the working copy are rejected. The brief forbids edits and deletions. Lane hashes the paths before launch and compares afterward, including directory contents, names, file types, permissions, and symlink targets. Missing paths are recorded too, so creating one counts as a change. |
+| `--prewalk SHA` | Commit demonstrating the design to extend. Requires cwd in a Git repository and a commit that is an ancestor of `HEAD`; invalid inputs yield `usage_error`. Lane records the resolved commit in `params.json` and appends its short SHA, subject, `git show --stat` file list, and the rule below to the coding brief. |
+
+Examples, one for each handoff:
+
+```bash
+lane run --brief /tmp/task.md --cwd ~/code/app --profile implement --context ~/code/app/CONTEXT.md
+lane run --brief /tmp/task.md --cwd ~/code/app --profile implement \
+  --holdout 'python3 -m unittest discover -s tests' --protect tests/test_acceptance.py
+lane run --brief /tmp/remaining-cases.md --cwd ~/code/app --profile implement --prewalk HEAD
+```
+
+The prewalk rule is appended verbatim:
+
+> The demonstrated pattern is a settled design decision: extend it to the remaining cases; do not redesign it, do not re-implement it in parallel elsewhere, and do not delete and rewrite it. If the pattern cannot work for a case, say so explicitly in your final report instead of silently diverging.
+
+Results always include `holdout`: `null` without `--holdout`, otherwise `{cmd, exit_code, passed, tampered, log}`. `passed` is true only for exit code 0 with no changed protected paths. `tampered` lists the protected arguments whose snapshots changed or could no longer be read; the check covers changes made by the worker or the command. `log` is the absolute path to the full output. Timeouts return holdout exit code 124. If the worker could not launch or its process group is still alive, the check is skipped with a null exit code and `passed: false`. A holdout failure does not change the top-level worker `status` or Lane exit code: callers must inspect `holdout.passed`.
+
+`--retry-of ID` inherits the previous run's `context`, `holdout`, `protect`, and `prewalk` from `params.json`. Passing a flag again replaces that setting; repeatable flags replace the whole previous list. Settings are independent: replacing the command still retains the protected paths unless `--protect` is passed again. Paths and commits are validated for the new run, and protected snapshots are taken again in its working copy.
 
 ### Results and exit codes
 
@@ -157,7 +186,7 @@ Then run `lane run --brief ... --cwd ... --profile spark`. `auto` routing never 
 | `LANE_SPARK_BASE_URL`, `LANE_SPARK_KEYCHAIN_SERVICE` | | self-hosted server, if not set in your profiles file |
 | `LANE_DEEPSEEK_CATALOG` | | experimental DeepSeek provider |
 
-Each run lives in `$LANE_STATE/runs/<lane_id>/`, which can hold `brief.md` (with the output contract appended), `params.json`, `argv.json`, `events.jsonl`, `stderr.log`, `final.md` and `result.json`.
+Each run lives in `$LANE_STATE/runs/<lane_id>/`, which can hold `brief.md` (with handoff sections and the output contract appended), `params.json`, `argv.json`, `events.jsonl`, `stderr.log`, `holdout.log`, `final.md` and `result.json`.
 
 ## Tests
 

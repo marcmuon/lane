@@ -216,6 +216,207 @@ class LaneTest(unittest.TestCase):
         self.assertEqual((rc, b["status"]), (4, "busy_worktree"))
         self.lane("wait", s["lane_id"], "--max", "60")
 
+    # --- context, holdout and prewalk edge cases ---
+    def test_repeated_context_is_recorded_and_not_inlined_for_coding(self):
+        first, second = self.tmp / "goals.md", self.tmp / "rules.md"
+        first.write_text("CONTEXT GOALS CONTENT\n")
+        second.write_text("CONTEXT RULES CONTENT\n")
+        rc, r = self.run_lane("--context", str(first), "--context", str(second))
+        self.assertEqual((rc, r["status"]), (0, "ok"))
+        run = Path(r["run_dir"])
+        params = json.loads((run / "params.json").read_text())
+        self.assertEqual(params["context"], [str(first.resolve()), str(second.resolve())])
+        brief = (run / "brief.md").read_text()
+        self.assertLess(brief.index(str(first)), brief.index(str(second)))
+        self.assertNotIn("CONTEXT GOALS CONTENT", brief)
+        rc, r = self.run_lane("--context", str(self.work))
+        self.assertEqual((rc, r["status"]), (2, "usage_error"))
+        loop = self.tmp / "context-loop"
+        loop.symlink_to(loop)
+        rc, r = self.run_lane("--context", str(loop))
+        self.assertEqual((rc, r["status"]), (2, "usage_error"))
+
+    def test_answer_context_cap_counts_all_files_in_bytes(self):
+        first, second = self.tmp / "first.md", self.tmp / "second.md"
+        first.write_bytes(b"a" * (200 * 1024 - 8))
+        second.write_text("\U0001f600\U0001f600", encoding="utf-8")
+        for provider in ("openai", "claude"):
+            dump = self.tmp / f"{provider}-context.json"
+            rc, r = self.lane("run", "--brief", str(self.brief), "--answer-only", "--web-research",
+                              "--provider", provider, "--context", str(first), "--context", str(second),
+                              FAKE_CODEX_DUMP=dump, FAKE_CLAUDE_DUMP=dump)
+            self.assertEqual((rc, r["status"]), (0, "ok"))
+            prompt = json.loads(dump.read_text())["prompt"]
+            self.assertIn(first.read_text(), prompt)
+            self.assertIn(second.read_text(), prompt)
+            self.assertLess(prompt.index(str(first)), prompt.index(str(second)))
+            self.assertNotIn("OUTPUT CONTRACT", prompt)
+        second.write_text("\U0001f600\U0001f600!", encoding="utf-8")
+        rc, r = self.run_lane("--answer-only", "--context", str(first), "--context", str(second))
+        self.assertEqual((rc, r["status"]), (2, "usage_error"))
+
+    def test_worktree_context_includes_current_and_untracked_notes(self):
+        repo = self.git_repo()
+        goals = repo / "GOALS.md"
+        goals.write_text("old goals\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-qm", "goals"], check=True)
+        goals.write_text("current goals\n")
+        decisions = repo / "notes" / "DECISIONS.md"
+        decisions.parent.mkdir()
+        decisions.write_text("current decisions\n")
+        rc, r = self.lane("run", "--brief", str(self.brief), "--cwd", str(repo), "--worktree",
+                          "--context", str(goals), "--context", str(decisions))
+        self.assertEqual((rc, r["status"]), (0, "ok"))
+        worktree = Path(r["worktree"])
+        self.assertEqual((worktree / "GOALS.md").read_text(), goals.read_text())
+        self.assertEqual((worktree / "notes" / "DECISIONS.md").read_text(), decisions.read_text())
+        brief = (Path(r["run_dir"]) / "brief.md").read_text()
+        self.assertIn(str(worktree / "notes" / "DECISIONS.md"), brief)
+        self.assertEqual(goals.read_text(), "current goals\n")
+        self.assertEqual(decisions.read_text(), "current decisions\n")
+
+    def test_protected_directory_detects_worker_deletions_and_additions(self):
+        folder = self.work / "checks"
+        folder.mkdir()
+        original = folder / "acceptance.txt"
+        for action, name in (("FAKE_CODEX_REMOVE", "checks/acceptance.txt"),
+                             ("FAKE_CODEX_CLOBBER", "checks/added.txt")):
+            with self.subTest(action=action):
+                original.write_text("original\n")
+                rc, r = self.run_lane("--holdout", "true", "--protect", "checks", **{action: name})
+                self.assertEqual((rc, r["status"]), (0, "ok"))
+                self.assertEqual((r["holdout"]["exit_code"], r["holdout"]["passed"], r["holdout"]["tampered"]),
+                                 (0, False, ["checks"]))
+
+    def test_holdout_checks_deletion_and_new_protected_paths(self):
+        original = self.work / "acceptance.txt"
+        original.write_text("original\n")
+        _, r = self.run_lane("--holdout", "rm acceptance.txt; touch missing.txt",
+                             "--protect", "acceptance.txt", "--protect", "missing.txt")
+        self.assertEqual((r["holdout"]["exit_code"], r["holdout"]["passed"], r["holdout"]["tampered"]),
+                         (0, False, ["acceptance.txt", "missing.txt"]))
+
+    def test_holdout_cannot_hide_worker_tampering_by_restoring_the_file(self):
+        original = self.work / "acceptance.txt"
+        original.write_text("original\n")
+        _, r = self.run_lane("--holdout", "printf 'original\\n' > acceptance.txt", "--protect", "acceptance.txt",
+                             FAKE_CODEX_CLOBBER="acceptance.txt")
+        self.assertEqual(original.read_text(), "original\n")
+        self.assertEqual((r["holdout"]["passed"], r["holdout"]["tampered"]), (False, ["acceptance.txt"]))
+
+    def test_holdout_preserves_worker_failure_and_saves_full_output(self):
+        command = "printf 'stdout\\n'; printf 'stderr\\n' >&2; exit 7"
+        rc, r = self.run_lane("--holdout", command, FAKE_CODEX_MODE="nomarker")
+        self.assertEqual((rc, r["status"]), (1, "contract_violation"))
+        holdout = r["holdout"]
+        self.assertEqual((holdout["cmd"], holdout["exit_code"], holdout["passed"], holdout["tampered"]),
+                         (command, 7, False, []))
+        self.assertEqual(Path(holdout["log"]).read_text(), "stdout\nstderr\n")
+        rc, saved = self.lane("result", r["lane_id"])
+        self.assertEqual((rc, saved["holdout"]), (1, holdout))
+
+    def test_holdout_from_repo_subdirectory_uses_cwd_and_repo_relative_protection(self):
+        repo = self.git_repo()
+        (repo / "subdir").mkdir()
+        (repo / "subdir" / "input.txt").write_text("input\n")
+        (repo / "protected.txt").write_text("original\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-qm", "inputs"], check=True)
+        _, r = self.lane("run", "--brief", str(self.brief), "--cwd", str(repo / "subdir"), "--worktree",
+                         "--holdout", "test -f input.txt && printf changed > ../protected.txt",
+                         "--protect", "protected.txt")
+        self.assertEqual(Path(r["cwd"]).resolve(), (Path(r["worktree"]) / "subdir").resolve())
+        self.assertEqual((r["holdout"]["exit_code"], r["holdout"]["passed"], r["holdout"]["tampered"]),
+                         (0, False, ["protected.txt"]))
+        self.assertEqual((repo / "protected.txt").read_text(), "original\n")
+
+    def test_holdout_timeout_stops_its_process_group(self):
+        script = self.tmp / "slow_check.py"
+        child_pid = self.tmp / "holdout-child.pid"
+        script.write_text("import subprocess, sys, time\n"
+                          "from pathlib import Path\n"
+                          "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                          "Path(sys.argv[1]).write_text(str(child.pid))\n"
+                          "print('partial output', flush=True)\n"
+                          "time.sleep(60)\n")
+        command = f"'{sys.executable}' '{script}' '{child_pid}'"
+        with mock.patch.object(LANE_MODULE, "HOLDOUT_TIMEOUT_S", 0.5):
+            result = LANE_MODULE.run_holdout(self.tmp, {"holdout": command, "cwd": str(self.work)}, True)
+        self.assertEqual((result["exit_code"], result["passed"], result["tampered"]), (124, False, []))
+        self.assertIn("partial output", Path(result["log"]).read_text())
+        self.assertIn("timed out", Path(result["log"]).read_text())
+        child = int(child_pid.read_text())
+        deadline = time.time() + 3
+        while LANE_MODULE.alive(child) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(LANE_MODULE.alive(child))
+
+    def test_invalid_protection_and_empty_holdout_are_usage_errors(self):
+        (self.work / "outside").symlink_to(self.tmp, target_is_directory=True)
+        for flags in (("--holdout", " "), ("--protect", "checks"),
+                      ("--holdout", "true", "--protect", str(self.brief)),
+                      ("--holdout", "true", "--protect", "../brief.md"),
+                      ("--holdout", "true", "--protect", "outside/brief.md")):
+            with self.subTest(flags=flags):
+                rc, r = self.run_lane(*flags)
+                self.assertEqual((rc, r["status"]), (2, "usage_error"))
+        self.assertFalse(any((self.tmp / "state" / "runs").glob("*/params.json")))
+
+    def test_prewalk_rejects_nonrepo_noncommit_and_nonancestor(self):
+        rc, r = self.run_lane("--prewalk", "HEAD")
+        self.assertEqual((rc, r["status"]), (2, "usage_error"))
+        repo = self.git_repo()
+        def git(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        base = git("rev-parse", "HEAD")
+        git("commit", "-q", "--allow-empty", "-m", "other branch")
+        other = git("rev-parse", "HEAD")
+        git("checkout", "-q", "--detach", base)
+        tree = git("rev-parse", "HEAD^{tree}")
+        for sha in (other, tree):
+            rc, r = self.lane("run", "--brief", str(self.brief), "--cwd", str(repo), "--prewalk", sha)
+            self.assertEqual((rc, r["status"]), (2, "usage_error"))
+        rc, r = self.lane("run", "--brief", str(self.brief), "--cwd", str(repo), "--answer-only", "--prewalk", base)
+        self.assertEqual((rc, r["status"]), (2, "usage_error"))
+
+    def test_retry_explicit_handoff_flags_replace_previous_settings(self):
+        repo = self.git_repo()
+        def git(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        for name in ("old.md", "new.md", "old.txt", "new.txt"):
+            (repo / name).write_text(name + "\n")
+        git("add", "-A")
+        git("commit", "-qm", "first pattern")
+        first = git("rev-parse", "HEAD")
+        _, r = self.lane("run", "--brief", str(self.brief), "--cwd", str(repo), "--profile", "review",
+                         "--context", str(repo / "old.md"), "--holdout", "true", "--protect", "old.txt",
+                         "--prewalk", first, FAKE_CODEX_MODE="ok_review")
+        self.assertEqual(r["status"], "ok")
+        git("commit", "-q", "--allow-empty", "-m", "second pattern")
+        second = git("rev-parse", "HEAD")
+        command = "printf 'replacement\\n'; exit 9"
+        rc, retry = self.lane("run", "--brief", str(self.brief), "--cwd", str(repo), "--retry-of", r["lane_id"],
+                             "--context", str(repo / "new.md"), "--holdout", command, "--protect", "new.txt",
+                             "--prewalk", second, FAKE_CODEX_MODE="ok_review", FAKE_CODEX_CLOBBER="old.txt")
+        self.assertEqual((rc, retry["status"]), (0, "ok"))
+        self.assertEqual((retry["holdout"]["cmd"], retry["holdout"]["exit_code"], retry["holdout"]["tampered"]),
+                         (command, 9, []))
+        params = json.loads((Path(retry["run_dir"]) / "params.json").read_text())
+        self.assertEqual((params["context"], params["protect"], params["prewalk"]),
+                         ([str((repo / "new.md").resolve())], ["new.txt"], second))
+        brief = (Path(retry["run_dir"]) / "brief.md").read_text()
+        self.assertIn("second pattern", brief)
+        self.assertNotIn("old.md", brief)
+        self.assertIn("The demonstrated pattern is a settled design decision: extend it to the remaining cases; "
+                      "do not redesign it, do not re-implement it in parallel elsewhere, and do not delete and rewrite it. "
+                      "If the pattern cannot work for a case, say so explicitly in your final report instead of silently diverging.",
+                      brief)
+
     # --- review round 1 fixes ---
     def test_marker_must_be_first_line(self):
         self.assertEqual(self.run_lane(FAKE_CODEX_MODE="late_marker")[1]["status"], "contract_violation")

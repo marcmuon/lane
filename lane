@@ -11,6 +11,7 @@ Commands:
   lane start  --brief FILE --cwd DIR [--model M] [--effort E] [--kind task|review] [--sandbox read-only|workspace-write]
               [--worktree] [--label L] [--max-time 60m] [--provider openai|claude|deepseek|spark] [--tier default|fast|flex]
               [--network] [--add-dir DIR]... [--codex-home DIR] [--wait-slot SECONDS] [--force]
+              [--context PATH]... [--holdout CMD] [--protect PATH]... [--prewalk SHA]
   lane wait   ID [--max SECONDS]         block until the lane finishes (or --max elapses: status=running, exit 3)
   lane run    (same flags as start)      start + wait until finished
   lane route  (same flags as start)      print the routing decision; launches nothing
@@ -94,6 +95,11 @@ EXA_URL = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_
 EXA_TOOLS = ("web_search_exa", "web_fetch_exa", "web_search_advanced_exa")
 EXA_TOOL_NAMES = tuple(f"mcp__exa__{tool}" for tool in EXA_TOOLS)
 CODE_MODE_FEATURES = ("code_mode", "code_mode_only", "code_mode_host", "code_mode_prewarm")
+CONTEXT_MAX_BYTES = 200 * 1024
+HOLDOUT_TIMEOUT_S = 30 * 60
+PREWALK_RULE = ("The demonstrated pattern is a settled design decision: extend it to the remaining cases; "
+                "do not redesign it, do not re-implement it in parallel elsewhere, and do not delete and rewrite it. "
+                "If the pattern cannot work for a case, say so explicitly in your final report instead of silently diverging.")
 # Codex 0.161.0 feature names. Some model-defined tools have no CLI off switch;
 # see README and the post-run audit (including the raw rollout).
 ANSWER_DISABLED_FEATURES = (
@@ -1103,6 +1109,77 @@ def overlapping_lanes(run: Path, codex_home: str, start: float, end: float) -> i
 
 # ---------- supervisor (runs detached; the only writer of status.json after launch) ----------
 
+def hash_protected(path: Path) -> str | None:
+    """Hash names, types and contents, including empty directories and symlink targets."""
+    digest = hashlib.sha256()
+
+    def visit(item: Path):
+        mode = item.lstat().st_mode
+        digest.update(json.dumps([str(item.relative_to(path)), mode]).encode() + b"\0")
+        if item.is_symlink():
+            digest.update(os.fsencode(os.readlink(item)))
+        elif item.is_dir():
+            for child in sorted(item.iterdir()):
+                visit(child)
+        elif item.is_file():
+            with item.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(64 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            raise OSError(f"protected path is not a file or directory: {item}")
+        digest.update(b"\0")
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    visit(path)
+    return digest.hexdigest()
+
+
+def check_protected(p: dict) -> list[str]:
+    changed = []
+    for name, before in p.get("protected_hashes", {}).items():
+        try:
+            after = hash_protected(Path(p["protect_root"]) / name)
+        except OSError:
+            changed.append(name)
+        else:
+            if after != before:
+                changed.append(name)
+    return changed
+
+
+def run_holdout(run: Path, p: dict, worker_exited: bool) -> dict | None:
+    if p.get("holdout") is None:
+        return None
+    log = run / "holdout.log"
+    tampered = check_protected(p)
+    exit_code = None
+    with log.open("wb") as output:
+        if not worker_exited:
+            output.write(b"Holdout not run: the worker did not exit or could not be launched.\n")
+        else:
+            try:
+                proc = subprocess.Popen(p["holdout"], shell=True, cwd=p["cwd"], stdin=subprocess.DEVNULL,
+                                        stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            except OSError as exc:
+                exit_code = 127
+                output.write(f"Holdout could not start: {exc}\n".encode())
+            else:
+                try:
+                    exit_code = proc.wait(timeout=HOLDOUT_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    exit_code = 124
+                    output.write(b"\nHoldout timed out after 30 minutes.\n")
+                finally:
+                    stop_group(proc.pid, reap=proc.poll)
+                    proc.wait(timeout=KILL_GRACE_S)
+    tampered = sorted(set(tampered + check_protected(p)))
+    return {"cmd": p["holdout"], "exit_code": exit_code, "passed": exit_code == 0 and not tampered,
+            "tampered": tampered, "log": str(log)}
+
+
 def supervise(lane_id: str) -> int:
     run = RUNS / lane_id
     p = read_json(run / "params.json")
@@ -1167,6 +1244,7 @@ STUCK_GROUP = "worker process group survived SIGKILL; its write roots stay reser
 def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: bool, started: float,
            setup_error: str = "", stuck: bool = False, secret: str | None = None) -> int:
     is_claude = p["provider"] == "claude"
+    holdout = run_holdout(run, p, worker_exited=rc is not None and not stuck)
     scrub_run(run, secret if secret is not None else worker_secret(p))
     ev = parse_claude_events(run / "events.jsonl") if is_claude else parse_events(run / "events.jsonl")
     if is_claude:
@@ -1230,6 +1308,7 @@ def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: boo
         "quota_delta_raw": raw_delta, "quota_delta": delta, "overlapping_lanes": overlap,
         "run_dir": str(run), "finished_at": ended,
         "profile": p.get("profile"), "routing": p.get("routing"),
+        "holdout": holdout,
     }
     if audit is not None:
         result.update(answer_only=True, web_research=p.get("web_research", False),
@@ -1250,6 +1329,13 @@ def finish(run: Path, p: dict, status: dict, rc, timed_out: bool, cancelled: boo
 
 def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool = False) -> int:
     brief = Path(a.brief).expanduser().resolve()
+    if a.retry_of:
+        previous = read_json(RUNS / a.retry_of / "params.json") or {}
+        for field in ("context", "holdout", "protect", "prewalk"):
+            if getattr(a, field) is None:
+                setattr(a, field, previous.get(field))
+    a.context = a.context or []
+    a.protect = a.protect or []
     if a.web_research and not a.answer_only:
         raise UsageError("--web-research requires --answer-only")
     if a.answer_only and (a.worktree or a.network or a.add_dir or a.sandbox == "workspace-write"):
@@ -1262,6 +1348,37 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
         return emit({"status": "usage_error", "error": f"brief missing or empty: {brief}"}, 2)
     if cwd is not None and not cwd.is_dir():
         return emit({"status": "usage_error", "error": f"cwd not a directory: {cwd}"}, 2)
+    try:
+        context = [Path(name).expanduser().resolve() for name in a.context]
+    except (OSError, RuntimeError) as exc:
+        raise UsageError(f"can't resolve --context file: {exc}") from None
+    for path in context:
+        if not path.is_file():
+            raise UsageError(f"--context must be an existing file: {path}")
+    a.context = [str(path) for path in context]
+    context_section = ""
+    if a.answer_only and context:
+        total = 0
+        parts = []
+        for path in context:
+            try:
+                with path.open("rb") as fh:
+                    contents = fh.read(CONTEXT_MAX_BYTES - total + 1)
+            except OSError as exc:
+                raise UsageError(f"can't read --context {path}: {exc}") from None
+            total += len(contents)
+            if total > CONTEXT_MAX_BYTES:
+                raise UsageError("--answer-only context exceeds the 200 KB total cap")
+            parts.append(f"\n\n## CONTEXT: {path}\n{contents.decode('utf-8', errors='replace')}")
+        context_section = "\n\n---\nCONTEXT: project goals, decisions and rules. Read this before answering." + "".join(parts)
+    if a.holdout is not None and not a.holdout.strip():
+        raise UsageError("--holdout must be a non-empty shell command")
+    for name in a.protect:
+        if Path(name).is_absolute() or ".." in Path(name).parts:
+            raise UsageError(f"--protect must be a repo-relative path: {name}")
+    a.protect = list(dict.fromkeys(str(Path(name)) for name in a.protect))
+    if a.protect and a.holdout is None:
+        raise UsageError("--protect requires --holdout")
     a.cwd = str(cwd) if cwd is not None else None
     routing, refusal = resolve_route(a, brief_text)
     if refusal:
@@ -1269,6 +1386,19 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
     if a.answer_only:
         # Profiles may select a model/effort, but cannot grant write access.
         a.sandbox, a.worktree = "read-only", False
+    repo = None if a.answer_only else git(cwd, "rev-parse", "--show-toplevel")
+    prewalk_section = ""
+    if a.prewalk is not None:
+        if not repo:
+            raise UsageError("--prewalk needs cwd inside a git repo")
+        commit = git(cwd, "rev-parse", "--verify", "--end-of-options", a.prewalk + "^{commit}")
+        if not commit or git(cwd, "merge-base", "--is-ancestor", commit, "HEAD") is None:
+            raise UsageError(f"--prewalk must be a commit that is an ancestor of HEAD: {a.prewalk}")
+        a.prewalk = commit
+        short = git(cwd, "rev-parse", "--short=7", commit)
+        subject = git(cwd, "show", "-s", "--format=%s", commit, "--")
+        files = git(cwd, "show", "--stat", "--format=", "--no-ext-diff", commit, "--")
+        prewalk_section = f"\n\n---\nPREWALK: {short} {subject}\n\n{files}\n\n{PREWALK_RULE}"
     if route_only:
         return emit({"status": "routed", "profile": routing.get("profile"), "provider": a.provider, "model": a.model, "effort": a.effort,
                      "kind": a.kind, "sandbox": a.sandbox, "worktree": a.worktree, "max_time_s": a.max_time,
@@ -1287,7 +1417,6 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
             return emit(refusal, 4 if refusal["status"] == "provider_unavailable" else 2)
     elif a.model == "auto":
         return emit({"status": "usage_error", "error": f"model auto only works with a self-hosted provider, not {a.provider}"}, 2)
-    repo = None if a.answer_only else git(cwd, "rev-parse", "--show-toplevel")
     if a.worktree and not repo:
         return emit({"status": "usage_error", "error": "--worktree needs cwd inside a git repo"}, 2)
     RUNS.mkdir(parents=True, exist_ok=True)
@@ -1351,15 +1480,49 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
                 where = (f"\n\n---\nWORKING COPY: you are in {work_cwd}, a git worktree of {repo} on branch {branch}. "
                          f"Read, edit, test and commit only there. Paths under {repo} in this brief mean the same "
                          f"files in your working copy. Never change {repo} itself.")
-            (run / "brief.md").write_text(brief_text if a.answer_only else
-                                         brief_text.rstrip() + where + CONTRACTS[a.kind] + "\n")
+            if not a.answer_only and context:
+                working_context = []
+                for source in context:
+                    path = source
+                    if worktree and source.is_relative_to(repo):
+                        path = worktree / source.relative_to(repo)
+                        if not path.resolve().is_relative_to(worktree.resolve()):
+                            raise UsageError(f"--context path escapes the working copy: {path}")
+                        try:
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(source, path)
+                        except OSError as exc:
+                            raise UsageError(f"can't copy --context {source} into the working copy: {exc}") from None
+                    working_context.append(path)
+                context_section = ("\n\n---\nCONTEXT: read these files first. They hold the project's goals, decisions and rules.\n"
+                                   + "\n".join(f"- {path}" for path in working_context))
+            protect_root = Path(worktree or repo or work_cwd)
+            protected_hashes = {}
+            for name in a.protect:
+                path = protect_root / name
+                try:
+                    if not path.resolve().is_relative_to(protect_root.resolve()):
+                        raise UsageError(f"--protect path escapes the working copy: {name}")
+                    protected_hashes[name] = hash_protected(path)
+                except (OSError, RuntimeError) as exc:
+                    raise UsageError(f"can't hash --protect {name}: {exc}") from None
+            holdout_section = ""
+            if a.holdout is not None:
+                holdout_section = (f"\n\n---\nHOLDOUT: after you finish, Lane runs this shell command in {work_cwd}, "
+                                   f"outside the worker sandbox (30-minute timeout):\n{a.holdout}\n"
+                                   f"Protected paths (relative to {protect_root}): do not edit or delete them.\n"
+                                   + ("\n".join(f"- {name}" for name in a.protect) or "(none)"))
+            additions = context_section + prewalk_section + holdout_section
+            (run / "brief.md").write_text(brief_text + additions if a.answer_only else
+                                         brief_text.rstrip() + where + additions + CONTRACTS[a.kind] + "\n")
             params = {"kind": a.kind, "label": a.label or brief.stem, "provider": a.provider, "model": a.model,
                       "effort": a.effort, "sandbox": a.sandbox, "cwd": str(work_cwd), "codex_home": codex_home,
                       "tier": a.tier, "network": a.network, "add_dir": add_dirs, "git_dir": git_dir,
                       "max_time_s": a.max_time, "worktree": str(worktree) if worktree else None, "branch": branch,
                       "brief_source": str(brief), "quota_before": quota,
                       "profile": routing.get("profile"), "routing": routing, "rules_cwd": a.cwd,
-                      "endpoint": endpoint}
+                      "endpoint": endpoint, "context": a.context, "holdout": a.holdout, "protect": a.protect,
+                      "prewalk": a.prewalk, "protect_root": str(protect_root), "protected_hashes": protected_hashes}
             if a.answer_only:
                 params.update(answer_only=True, web_research=a.web_research)
             write_json(run / "params.json", params)
@@ -1380,7 +1543,7 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
     finally:
         fcntl.flock(lock_fh, fcntl.LOCK_UN)
     if wait_after:
-        return wait_for(lane_id, params["max_time_s"] + 120)
+        return wait_for(lane_id, params["max_time_s"] + (HOLDOUT_TIMEOUT_S if a.holdout is not None else 0) + 120)
     return emit({"lane_id": lane_id, "status": "started", "run_dir": str(run), "model": a.model, "effort": a.effort,
                  "codex_home": codex_home,
                  "profile": routing.get("profile"), "routing": routing,
@@ -1593,6 +1756,10 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--web-research", action="store_true", help="allow only keyless Exa tools; requires --answer-only")
         s.add_argument("--profile", default=None, help="profile name from profiles.json, or 'auto'")
         s.add_argument("--retry-of", default=None, help="lane id to escalate from (next profile on the ladder)")
+        s.add_argument("--context", action="append", help="file holding project goals, decisions and rules; repeatable")
+        s.add_argument("--holdout", help="shell command Lane runs after the worker, outside its sandbox")
+        s.add_argument("--protect", action="append", help="repo-relative file or directory the worker must not edit; repeatable")
+        s.add_argument("--prewalk", help="ancestor commit demonstrating the settled implementation pattern")
         s.add_argument("--model", default=None)
         s.add_argument("--effort", default=None, choices=EFFORTS)
         s.add_argument("--kind", default=None, choices=("task", "review"))

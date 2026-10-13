@@ -84,9 +84,32 @@ For Claude Code, copy the [example relay agent](examples/claude-code-agent.md) t
 
 Common profiles are `investigate` for read-only exploration, `implement` for code changes in a worktree, `review` for a review, and `opus` for implementation with Claude. To let Lane choose a Codex write profile, use `--profile auto --sandbox workspace-write` with `Owned paths:` in the brief. See the [profile reference](docs/reference.md#profiles) for routing rules and retries.
 
+## Carry context, checks, and a demonstrated pattern
+
+Repeat `--context PATH` to give the worker files containing the project's goals, decisions, and rules. Lane tells coding workers to read them first and copies repository context files into their worktree, including current uncommitted notes. For `--answer-only`, including `--web-research`, Lane inlines the contents instead; the combined limit is 200 KB (204,800 bytes). Missing files or excessive inline context return `usage_error`.
+
+```bash
+lane run --brief /tmp/add-flag.md --cwd ~/code/app --profile implement --context ~/code/app/CONTEXT.md
+```
+
+Use `--holdout CMD` to run your own acceptance command in the worker's working directory after it exits, outside its sandbox, with a 30-minute timeout. Repeat `--protect PATH` to name repository files or directories the worker must not edit. Lane hashes them before launch and checks them after the worker and command finish. Read `holdout.passed`: it is true only when the command exits 0 and the protected paths are unchanged. The worker's top-level `status` stays unchanged; the full command output is saved at `holdout.log` in the result.
+
+```bash
+lane run --brief /tmp/add-flag.md --cwd ~/code/app --profile implement \
+  --holdout 'python3 -m unittest discover -s tests' --protect tests/test_acceptance.py
+```
+
+Use `--prewalk SHA` to hand over a real edit demonstrating the pattern to extend. The commit must be an ancestor of the repository's current `HEAD`. Lane adds its short SHA, subject, file statistics, and an instruction to extend the settled design to the brief.
+
+```bash
+lane run --brief /tmp/remaining-cases.md --cwd ~/code/app --profile implement --prewalk HEAD
+```
+
+All these flags work with `start` and `run`. `--retry-of ID` carries forward each previous context, holdout, protect, and prewalk setting unless you provide that flag again. See the [handoff reference](docs/reference.md#context-checks-and-prewalk) for validation and result fields.
+
 ## Answer a brief or research the web
 
-Use `--answer-only` to get a written answer from Codex or Claude. Lane sends the brief unchanged, with a minimal instruction to answer directly. It adds no output contract, repository rules, or skills instructions. The answer is returned in `summary` and saved to `report_path`; no `STATUS:` or `VERDICT:` marker is required.
+Use `--answer-only` to get a written answer from Codex or Claude. Lane sends the brief unchanged unless `--context` adds inline context, with a minimal instruction to answer directly. It adds no output contract, repository rules, or skills instructions. The answer is returned in `summary` and saved to `report_path`; no `STATUS:` or `VERDICT:` marker is required.
 
 ```bash
 lane run --answer-only --brief /tmp/idea-card.md --model gpt-6-astra

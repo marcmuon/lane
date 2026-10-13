@@ -60,6 +60,8 @@ if _leak:
     ev({"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": f"thinking about {_leak}"}})
 if os.environ.get("FAKE_CODEX_CLOBBER"):
     Path(os.environ["FAKE_CODEX_CLOBBER"]).write_text("rotated-key\n")
+if os.environ.get("FAKE_CODEX_REMOVE"):
+    Path(os.environ["FAKE_CODEX_REMOVE"]).unlink()
 if mode == "slow_child":
     # a descendant that ignores SIGTERM, so only a whole-group KILL stops it
     import subprocess
