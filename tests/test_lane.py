@@ -279,8 +279,13 @@ class LaneTest(unittest.TestCase):
         _, r = self.lane("run", "--brief", str(self.brief), "--cwd", str(repo), "--sandbox", "workspace-write",
                          "--worktree")
         argv = json.loads((Path(r["run_dir"]) / "argv.json").read_text())["argv"]
-        dirs = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
-        self.assertIn(str((repo / ".git").resolve()), [str(Path(d).resolve()) for d in dirs])
+        dirs = [str(Path(argv[i + 1]).resolve()) for i, a in enumerate(argv) if a == "--add-dir"]
+        common = (repo / ".git").resolve()
+        wt_gitdir = Path(subprocess.run(["git", "-C", r["worktree"], "rev-parse", "--absolute-git-dir"],
+                                        capture_output=True, text=True).stdout.strip()).resolve()
+        # only what a commit on lane/* needs; never the whole .git (config, hooks, other branches)
+        self.assertEqual(sorted(dirs), sorted(str(p) for p in (wt_gitdir, common / "objects", common / "refs/heads/lane",
+                                                                common / "logs/refs/heads/lane")))
         # and two worktree lanes on one repo don't clash over that shared .git
         _, s = self.lane("start", "--brief", str(self.brief), "--cwd", str(repo), "--sandbox", "workspace-write",
                          "--worktree", FAKE_CODEX_MODE="slow", FAKE_CODEX_SLEEP=4)

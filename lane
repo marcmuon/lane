@@ -743,7 +743,7 @@ def build_claude_argv(p: dict, run: Path) -> tuple[list[str], dict]:
     else:
         argv += ["--permission-mode", "dontAsk", "--tools", "Read,Grep,Glob,Bash",
                  "--allowedTools", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(ls:*)", "Bash(cat:*)"]
-    for d in p["add_dir"] + ([p["git_dir"]] if p.get("git_dir") else []):
+    for d in p["add_dir"] + (p.get("git_dir") or []):
         argv += ["--add-dir", d]
     env = worker_env()
     env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
@@ -894,7 +894,7 @@ def build_argv(p: dict, final_path: Path) -> tuple[list[str], dict]:
             argv += ["-c", f"model_context_window={ep['context_window']}"]
     if p["network"]:
         argv += ["-c", "sandbox_workspace_write.network_access=true"]
-    for d in p["add_dir"] + ([p["git_dir"]] if p.get("git_dir") else []):
+    for d in p["add_dir"] + (p.get("git_dir") or []):
         argv += ["--add-dir", d]
     argv.append("-")
     return argv, env
@@ -1335,7 +1335,13 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
             if a.sandbox == "workspace-write" and repo:
                 common = git(work_cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
                 if common and not overlaps(common, str(worktree or repo)):
-                    git_dir = common            # lets a worktree lane commit; not a reserved write root
+                    # Lets a worktree lane commit; not reserved write roots. Codex blocks a worktree's gitdir under a
+                    # writable common dir yet leaves config, hooks and other branches writable, so grant only what a
+                    # commit on lane/* touches.
+                    own = git(work_cwd, "rev-parse", "--path-format=absolute", "--git-dir")
+                    git_dir = [d for d in (own if own != common else None, f"{common}/objects",
+                                           f"{common}/refs/heads/lane", f"{common}/logs/refs/heads/lane")
+                               if d and Path(d).is_dir()]
             run.mkdir(parents=True)
             made_run = True
             if a.answer_only:
