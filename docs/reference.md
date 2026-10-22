@@ -30,7 +30,7 @@ lane cancel <lane_id>
 
 Every command prints one JSON line on stdout. The exceptions: in a terminal, `status` and `result` print readable text (`LANE_JSON=1` keeps JSON), `watch` always prints text, and `--help` prints help.
 
-Other `start` flags: `--kind task|review`, `--sandbox read-only|workspace-write`, `--worktree`, `--max-time 45m`, `--model` and `--effort` (each overrides one field of the profile), `--provider`, `--add-dir DIR`, `--network`, `--codex-home DIR`, `--wait-slot SECONDS` (wait for a free slot instead of returning `busy`), `--label`, and `--force` (skip the quota checks).
+Other `start` flags: `--kind task|review`, `--sandbox read-only|workspace-write`, `--worktree`, `--max-time 45m`, `--model` and `--effort` (each overrides one field of the profile), `--provider`, `--add-dir DIR`, `--no-network` (workers get network access by default, so they can install dependencies and run local test servers; answer-only lanes never do), `--codex-home DIR`, `--wait-slot SECONDS` (wait for a free slot instead of returning `busy`), `--label`, and `--force` (skip the quota checks).
 
 ### Context, checks, and prewalk
 

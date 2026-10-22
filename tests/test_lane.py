@@ -1285,6 +1285,14 @@ class LaneTest(unittest.TestCase):
             self.assertNotIn("REPO RULE", (Path(r["run_dir"]) / "system.md").read_text())
             self.assertIsNone(r["routing"]["project_overrides"])
 
+    def test_network_is_on_by_default_and_no_network_turns_it_off(self):
+        for flags, on in (((), True), (("--network",), True), (("--no-network",), False)):
+            dump = self.tmp / f"network-{'-'.join(flags) or 'default'}.json"
+            rc, r = self.run_lane(*flags, FAKE_CODEX_DUMP=dump)
+            self.assertEqual((rc, r["status"]), (0, "ok"))
+            self.assertEqual("sandbox_workspace_write.network_access=true" in json.loads(dump.read_text())["argv"], on)
+            self.assertEqual(json.loads((Path(r["run_dir"]) / "params.json").read_text())["network"], on)
+
     def test_answer_only_rejects_incompatible_flags(self):
         for flags in (("--network",), ("--worktree",), ("--add-dir", str(self.work)),
                       ("--sandbox", "workspace-write")):

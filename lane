@@ -10,7 +10,7 @@ Commands print exactly one JSON line on stdout. In a terminal, status and result
 Commands:
   lane start  --brief FILE --cwd DIR [--model M] [--effort E] [--kind task|review] [--sandbox read-only|workspace-write]
               [--worktree] [--label L] [--max-time 60m] [--provider openai|claude|deepseek|spark] [--tier default|fast|flex]
-              [--network] [--add-dir DIR]... [--codex-home DIR] [--wait-slot SECONDS] [--force]
+              [--no-network] [--add-dir DIR]... [--codex-home DIR] [--wait-slot SECONDS] [--force]
               [--context PATH]... [--holdout CMD] [--protect PATH]... [--prewalk SHA] [--prewalk-plan FILE]
   lane wait   ID [--max SECONDS]         block until the lane finishes (or --max elapses: status=running, exit 3)
   lane run    (same flags as start)      start + wait until finished
@@ -1613,6 +1613,8 @@ def cmd_start(a: argparse.Namespace, wait_after: bool = False, route_only: bool 
         a.prewalk_plan = str(plan_path)
     if a.web_research and not a.answer_only:
         raise UsageError("--web-research requires --answer-only")
+    if a.network is None:  # workers install dependencies and run local test servers, so network is on unless the lane is answer-only
+        a.network = not a.answer_only
     if a.answer_only and (a.worktree or a.network or a.add_dir or a.sandbox == "workspace-write"):
         raise UsageError("--answer-only cannot use --worktree, --network, --add-dir or --sandbox workspace-write")
     if not a.answer_only and not a.cwd:
@@ -2075,7 +2077,8 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--max-time", default=None, type=parse_duration)
         s.add_argument("--provider", default=None, choices=PROVIDERS)
         s.add_argument("--tier", default="default", choices=("default", "fast", "flex"))
-        s.add_argument("--network", action="store_true")
+        s.add_argument("--network", action="store_true", default=None, help="give the worker network access (the default)")
+        s.add_argument("--no-network", dest="network", action="store_false", help="run the worker without network access")
         s.add_argument("--add-dir", action="append", default=[])
         s.add_argument("--codex-home", default="")
         s.add_argument("--wait-slot", type=float, default=0.0)
